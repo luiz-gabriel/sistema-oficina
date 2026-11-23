@@ -258,7 +258,7 @@ pub fn parear_aparelho(conn: &Connection, codigo: &str, nome_aparelho: &str, ago
     let sessao = iniciar_sessao(conn, &msg_cliente, agora)?;
     let chave = pake::cliente_concluir(iniciado, &sessao.msg_servidor).map_err(|_| erro_codigo("Código incorreto."))?;
     let mac_cliente = pake::confirmar_cliente(&chave, &msg_cliente, &sessao.msg_servidor);
-    let confirmacao = confirmar_sessao(conn, sessao.sessao_id, nome_aparelho, &mac_cliente, agora)?;
+    let confirmacao = confirmar_sessao(conn, sessao.sessao_id, nome_aparelho, &mac_cliente, None, agora)?;
     if !pake::conferir_servidor(&chave, &msg_cliente, &sessao.msg_servidor, &confirmacao.mac_servidor) {
         return Err(erro_codigo("O computador principal não provou que é ele. Confira o código e tente de novo."));
     }
@@ -304,12 +304,18 @@ pub fn confirmar_sessao(
     sessao_id: i64,
     nome_aparelho: &str,
     mac_cliente: &[u8],
+    identidade_rede: Option<&str>,
     agora: DateTime<Utc>,
 ) -> AppResult<ConfirmacaoPareamento> {
     let mut v = Validator::new();
     let nome = v.text("nome", Some(nome_aparelho), true, 60);
     v.finish()?;
     let nome = nome.unwrap_or_default();
+    // Identidade do computador na rede local (quando o aparelho é um computador da rede).
+    let identidade_rede = identidade_rede.map(str::trim).filter(|i| !i.is_empty()).map(str::to_string);
+    if identidade_rede.as_deref().is_some_and(|i| i.len() > 120) {
+        return Err(AppError::Validation(vec![FieldError { field: "identidade".into(), message: "Identidade muito longa.".into() }]));
+    }
 
     em_transacao(conn, || {
         let sessao: Option<(i64, String, String, String, i64, String)> = conn
@@ -362,9 +368,9 @@ pub fn confirmar_sessao(
         conn.execute("UPDATE codigos_pareamento SET situacao = 'USADO', codigo_pake = NULL WHERE id = ?1", [codigo_id])?;
         conn.execute("UPDATE pareamentos_em_andamento SET situacao = 'CONCLUIDA', chave = '' WHERE id = ?1", [sessao_id])?;
         conn.execute(
-            "INSERT INTO pedidos_pareamento (nome_aparelho, criado_em, situacao, segredo_hash, chave_transporte)
-             VALUES (?1, ?2, 'PENDENTE', ?3, ?4)",
-            params![nome, agora_txt(agora), sha256_hex(&chave_hex), chave_hex],
+            "INSERT INTO pedidos_pareamento (nome_aparelho, criado_em, situacao, segredo_hash, chave_transporte, identidade_rede)
+             VALUES (?1, ?2, 'PENDENTE', ?3, ?4, ?5)",
+            params![nome, agora_txt(agora), sha256_hex(&chave_hex), chave_hex, identidade_rede],
         )?;
         let mac_servidor = pake::confirmar_servidor(&chave, &msg_c, &msg_s);
         Ok(Ok(ConfirmacaoPareamento { pedido_id: conn.last_insert_rowid(), mac_servidor }))
@@ -378,14 +384,14 @@ fn erro_codigo(mensagem: &str) -> AppError {
 /// Aprova o pedido e ocupa a vaga, tudo numa transação imediata. Recusa se o limite já foi atingido.
 pub fn aprovar_pedido(conn: &Connection, pedido_id: i64, nome_principal: &str, agora: DateTime<Utc>) -> AppResult<Dispositivo> {
     em_transacao(conn, || {
-        let situacao: Option<(String, String)> = conn
+        let situacao: Option<(String, String, Option<String>)> = conn
             .query_row(
-                "SELECT situacao, nome_aparelho FROM pedidos_pareamento WHERE id = ?1",
+                "SELECT situacao, nome_aparelho, identidade_rede FROM pedidos_pareamento WHERE id = ?1",
                 [pedido_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let Some((situacao, nome)) = situacao else {
+        let Some((situacao, nome, identidade_rede)) = situacao else {
             return Err(AppError::NotFound("Pedido não encontrado.".into()));
         };
         if situacao != "PENDENTE" {
@@ -396,9 +402,9 @@ pub fn aprovar_pedido(conn: &Connection, pedido_id: i64, nome_principal: &str, a
             return Err(AppError::Conflict(MSG_LIMITE.into()));
         }
         conn.execute(
-            "INSERT INTO dispositivos (nome, principal, criado_em, autorizado_em, situacao)
-             VALUES (?1, 0, ?2, ?2, 'ATIVO')",
-            params![nome, agora_txt(agora)],
+            "INSERT INTO dispositivos (nome, principal, criado_em, autorizado_em, situacao, identidade_rede)
+             VALUES (?1, 0, ?2, ?2, 'ATIVO', ?3)",
+            params![nome, agora_txt(agora), identidade_rede],
         )?;
         let id = conn.last_insert_rowid();
         conn.execute(
@@ -467,6 +473,18 @@ pub fn consultar_pedido(conn: &Connection, pedido_id: i64, prova: &str, agora: D
             _ => Err(nao_achou()),
         }
     })
+}
+
+/// Verdadeiro se a identidade de rede pertence a um aparelho removido e a nenhum aparelho ativo.
+/// Computadores da rede que nunca passaram pelo pareamento não são afetados (não aparecem aqui).
+pub fn identidade_rede_revogada(conn: &Connection, identidade: &str) -> AppResult<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT (EXISTS (SELECT 1 FROM dispositivos WHERE identidade_rede = ?1 AND situacao = 'REVOGADO'))
+              * (1 - EXISTS (SELECT 1 FROM dispositivos WHERE identidade_rede = ?1 AND situacao = 'ATIVO'))",
+        [identidade],
+        |r| r.get(0),
+    )?;
+    Ok(n == 1)
 }
 
 /// Revoga um dispositivo: sai de ATIVO (libera a vaga), perde a credencial e todas as sessões.

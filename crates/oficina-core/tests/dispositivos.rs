@@ -370,8 +370,8 @@ fn sessao_de_pareamento_so_serve_uma_vez() {
     let sessao = dispositivos::iniciar_sessao(&conn, &msg_c, agora).unwrap();
     let chave = pareamento_pake::cliente_concluir(iniciado, &sessao.msg_servidor).unwrap();
     let mac = pareamento_pake::confirmar_cliente(&chave, &msg_c, &sessao.msg_servidor);
-    dispositivos::confirmar_sessao(&conn, sessao.sessao_id, "Celular", &mac, agora).unwrap();
-    let de_novo = dispositivos::confirmar_sessao(&conn, sessao.sessao_id, "Celular", &mac, agora).unwrap_err();
+    dispositivos::confirmar_sessao(&conn, sessao.sessao_id, "Celular", &mac, None, agora).unwrap();
+    let de_novo = dispositivos::confirmar_sessao(&conn, sessao.sessao_id, "Celular", &mac, None, agora).unwrap_err();
     assert!(matches!(de_novo, AppError::Validation(_)), "{de_novo:?}");
 }
 
@@ -384,7 +384,7 @@ fn mac_errado_gasta_tentativa_e_nao_cria_pedido() {
     let (_iniciado, msg_c) = pareamento_pake::cliente_iniciar("000000");
     let sessao = dispositivos::iniciar_sessao(&conn, &msg_c, agora).unwrap();
     let falso = vec![0u8; 32];
-    let erro = dispositivos::confirmar_sessao(&conn, sessao.sessao_id, "Celular", &falso, agora).unwrap_err();
+    let erro = dispositivos::confirmar_sessao(&conn, sessao.sessao_id, "Celular", &falso, None, agora).unwrap_err();
     let AppError::Validation(campos) = &erro else { panic!("{erro:?}") };
     assert!(campos[0].message.contains("Restam 2"), "{erro:?}");
     let pedidos: i64 = conn.query_row("SELECT COUNT(*) FROM pedidos_pareamento", [], |r| r.get(0)).unwrap();
@@ -423,7 +423,7 @@ fn sessao_de_codigo_substituido_nao_confirma() {
     let chave = pareamento_pake::cliente_concluir(iniciado, &sessao.msg_servidor).unwrap();
     let mac = pareamento_pake::confirmar_cliente(&chave, &msg_c, &sessao.msg_servidor);
     dispositivos::iniciar_pareamento(&conn, agora).unwrap();
-    assert!(dispositivos::confirmar_sessao(&conn, sessao.sessao_id, "Celular", &mac, agora).is_err());
+    assert!(dispositivos::confirmar_sessao(&conn, sessao.sessao_id, "Celular", &mac, None, agora).is_err());
 }
 
 #[test]
@@ -434,4 +434,31 @@ fn consulta_sem_prova_valida_nao_mostra_o_pedido() {
     let (id, _prova) = pedido(&conn, "Celular", agora);
     let outra_prova = pareamento_pake::provar_consulta(&[1u8; 32], id);
     assert!(dispositivos::consultar_pedido(&conn, id, &outra_prova, agora).is_err());
+}
+
+/// Pareia um aparelho informando a identidade do computador na rede local (ou nenhuma).
+fn parear_com_identidade(conn: &Connection, identidade: Option<&str>, agora: DateTime<Utc>) -> i64 {
+    let c = dispositivos::iniciar_pareamento(conn, agora).unwrap();
+    let (iniciado, msg_c) = pareamento_pake::cliente_iniciar(&c.codigo);
+    let sessao = dispositivos::iniciar_sessao(conn, &msg_c, agora).unwrap();
+    let chave = pareamento_pake::cliente_concluir(iniciado, &sessao.msg_servidor).unwrap();
+    let mac = pareamento_pake::confirmar_cliente(&chave, &msg_c, &sessao.msg_servidor);
+    let confirmado = dispositivos::confirmar_sessao(conn, sessao.sessao_id, "PC da recepção", &mac, identidade, agora).unwrap();
+    dispositivos::aprovar_pedido(conn, confirmado.pedido_id, "PC", agora).unwrap().id
+}
+
+#[test]
+fn identidade_da_rede_fica_revogada_so_depois_de_remover_o_aparelho() {
+    let conn = db::open_in_memory().unwrap();
+    let agora = t0();
+    admin(&conn, "carlos");
+    dispositivos::garantir_principal(&conn, "PC", agora).unwrap();
+    assert!(!dispositivos::identidade_rede_revogada(&conn, "pc-recepcao").unwrap(), "desconhecida não é revogada");
+    let id = parear_com_identidade(&conn, Some("pc-recepcao"), agora);
+    assert!(!dispositivos::identidade_rede_revogada(&conn, "pc-recepcao").unwrap(), "aparelho ativo segue valendo");
+    dispositivos::revogar(&conn, id).unwrap();
+    assert!(dispositivos::identidade_rede_revogada(&conn, "pc-recepcao").unwrap());
+    // Pareando de novo a mesma identidade, ela volta a valer.
+    parear_com_identidade(&conn, Some("pc-recepcao"), agora);
+    assert!(!dispositivos::identidade_rede_revogada(&conn, "pc-recepcao").unwrap());
 }

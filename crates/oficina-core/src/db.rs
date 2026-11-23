@@ -428,6 +428,12 @@ fn migrar_pareamento_pake(conn: &Connection) -> AppResult<()> {
     if !colunas("pedidos_pareamento")?.iter().any(|c| c == "chave_transporte") {
         conn.execute_batch("ALTER TABLE pedidos_pareamento ADD COLUMN chave_transporte TEXT;")?;
     }
+    if !colunas("pedidos_pareamento")?.iter().any(|c| c == "identidade_rede") {
+        conn.execute_batch("ALTER TABLE pedidos_pareamento ADD COLUMN identidade_rede TEXT;")?;
+    }
+    if !colunas("dispositivos")?.iter().any(|c| c == "identidade_rede") {
+        conn.execute_batch("ALTER TABLE dispositivos ADD COLUMN identidade_rede TEXT;")?;
+    }
     Ok(())
 }
 

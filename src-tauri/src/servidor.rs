@@ -27,15 +27,27 @@ pub fn tratar_conexao(est: Arc<Estado>, s: TcpStream) {
     let Ok(Some(id)) = est.identidade() else { return };
     let papel = est.papel();
     let Ok(mut canal) = rede::aceitar(s, &id, &papel) else { return };
+    if removido(&est, &canal.info.dispositivo) {
+        return;
+    }
     rede::lembrar(&est, &canal.info.dispositivo, &canal.info.computador, &canal.info.ativado_em);
     est.ja_visto(&canal.info.dispositivo);
     while let Ok(msg) = canal.receber() {
+        // Removido no meio da conversa: a próxima mensagem já não é atendida (sem esperar a sessão expirar).
+        if removido(&est, &canal.info.dispositivo) {
+            break;
+        }
         let resp = tratar(&est, &canal.info, &msg);
         if canal.enviar(&resp).is_err() {
             break;
         }
         est.ja_visto(&canal.info.dispositivo);
     }
+}
+
+/// Computador da rede removido do pareamento. Se o banco não responde, nega (fecha por segurança).
+fn removido(est: &Estado, dispositivo: &str) -> bool {
+    est.db().and_then(|c| oficina_core::dispositivos::identidade_rede_revogada(&c, dispositivo)).unwrap_or(true)
 }
 
 fn tratar(est: &Estado, conexao: &Info, msg: &Value) -> Value {

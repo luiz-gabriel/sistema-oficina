@@ -57,6 +57,9 @@ struct ConfirmarPareamento {
     nome: String,
     #[serde(default)]
     mac: String,
+    /// Identidade do computador na rede local, quando o aparelho é um computador da rede.
+    #[serde(default)]
+    identidade: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -351,7 +354,7 @@ fn pareamento_confirmar(est: &Estado, req: &Requisicao) -> Resposta {
     let Ok(mac) = hex::decode(&dados.mac) else {
         return Resposta::erro(400, "validation", "Dados de pareamento inválidos.");
     };
-    let r = est.db().and_then(|c| dispositivos::confirmar_sessao(&c, dados.sessao, &dados.nome, &mac, Utc::now()));
+    let r = est.db().and_then(|c| dispositivos::confirmar_sessao(&c, dados.sessao, &dados.nome, &mac, dados.identidade.as_deref(), Utc::now()));
     match r {
         Ok(c) => Resposta::json(200, &json!({"pedido_id": c.pedido_id, "mac": hex::encode(c.mac_servidor)})),
         Err(e) => erro_app(e),
