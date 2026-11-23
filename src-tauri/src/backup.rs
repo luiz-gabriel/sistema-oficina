@@ -190,21 +190,14 @@ pub fn restaurar(est: &Estado, caminho: &str) -> AppResult<String> {
         let mut trava = est.piscina.write().map_err(|_| AppError::Database("conexão indisponível".into()))?;
         *trava = None;
         let abrir_novo = || -> AppResult<oficina_core::db::Piscina> {
-            limpar_wal(&banco);
-            std::fs::copy(&origem, &banco).map_err(|e| AppError::Database(format!("não foi possível copiar o arquivo: {e}")))?;
-            oficina_core::db::open(&banco)?;
+            trocar_arquivo(&origem, &banco)?;
             oficina_core::db::piscina(&banco)
         };
         match abrir_novo() {
             Ok(nova) => *trava = Some(nova),
             Err(erro) => {
-                limpar_wal(&banco);
-                let voltou = std::fs::copy(&seguranca, &banco).is_ok();
-                let reaberta = if voltou {
-                    oficina_core::db::open(&banco).ok().and_then(|_| oficina_core::db::piscina(&banco).ok())
-                } else {
-                    None
-                };
+                let voltou = trocar_arquivo(&seguranca, &banco).is_ok();
+                let reaberta = if voltou { oficina_core::db::piscina(&banco).ok() } else { None };
                 return match reaberta {
                     Some(p) => {
                         *trava = Some(p);
@@ -241,13 +234,33 @@ pub fn iniciar_automatico(est: Arc<Estado>) {
     });
 }
 
+/// Põe `origem` no lugar do banco por troca de nome (`rename`), nunca por cópia por cima do arquivo atual.
+/// Uma conexão antiga que ainda esteja aberta continua com o arquivo antigo, que já não tem nome; quando ela
+/// fechar, grava o WAL dela só nesse arquivo sem nome, e não sobre a restauração.
+fn trocar_arquivo(origem: &Path, banco: &Path) -> AppResult<()> {
+    let temporario = banco.with_file_name("oficina-restaurando.db");
+    let _ = std::fs::remove_file(&temporario);
+    let _ = std::fs::remove_file(sufixo(&temporario, "-wal"));
+    let _ = std::fs::remove_file(sufixo(&temporario, "-shm"));
+    std::fs::copy(origem, &temporario).map_err(|e| AppError::Database(format!("não foi possível copiar o arquivo: {e}")))?;
+    // Abrir e fechar aplica o esquema e o modo WAL; ao fechar, o WAL do temporário é gravado e apagado.
+    drop(oficina_core::db::open(&temporario)?);
+    // O WAL antigo (de outro banco) não pode ser aplicado ao arquivo novo: sai antes da troca.
+    limpar_wal(banco);
+    std::fs::rename(&temporario, banco).map_err(|e| AppError::Database(format!("não foi possível trocar o banco: {e}")))
+}
+
+fn sufixo(caminho: &Path, sufixo: &str) -> PathBuf {
+    let mut nome = caminho.as_os_str().to_owned();
+    nome.push(sufixo);
+    PathBuf::from(nome)
+}
+
 /// Apaga os arquivos auxiliares do modo WAL (`-wal` e `-shm`) de um banco. Sem isso, o SQLite aplicaria
 /// ao arquivo restaurado mudanças que pertencem ao banco antigo.
 fn limpar_wal(banco: &Path) {
-    for sufixo in ["-wal", "-shm"] {
-        let mut nome = banco.as_os_str().to_owned();
-        nome.push(sufixo);
-        let _ = std::fs::remove_file(PathBuf::from(nome));
+    for fim in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(sufixo(banco, fim));
     }
 }
 
@@ -326,6 +339,33 @@ mod testes {
         let nome: String = antigo.query_row("SELECT nome FROM clientes", [], |r| r.get(0)).unwrap();
         assert_eq!(nome, "Cliente atual");
         assert!(!Path::new(&caminho).exists(), "arquivo de restauração é apagado depois de usado");
+    }
+
+    #[test]
+    fn conexao_antiga_aberta_nao_desfaz_a_restauracao() {
+        // Regressão: uma conexão que ainda estava aberta no banco antigo, com WAL pendente, gravava esse WAL
+        // por cima do arquivo restaurado ao fechar.
+        let dir = pasta_temporaria("conexao-antiga");
+        let est = estado_em(&dir, "Cliente antigo");
+        let outro = pasta_temporaria("conexao-antiga-origem");
+        let origem = estado_em(&outro, "Cliente do backup");
+        {
+            let c = origem.db().unwrap();
+            c.execute("VACUUM INTO ?1", [outro.join("copia.db").to_string_lossy().to_string()]).unwrap();
+        }
+        let b64 = base64::engine::general_purpose::STANDARD.encode(std::fs::read(outro.join("copia.db")).unwrap());
+        let caminho = validar_arquivo(&est, &b64).unwrap()["caminho"].as_str().unwrap().to_string();
+
+        // Conexão à parte, aberta no arquivo antes da restauração (como outro processo ou uma consulta em curso).
+        let antiga = rusqlite::Connection::open(dir.join("oficina.db")).unwrap();
+        antiga.query_row("SELECT COUNT(*) FROM clientes", [], |r| r.get::<_, i64>(0)).unwrap();
+        restaurar(&est, &caminho).unwrap();
+        drop(antiga);
+
+        assert_eq!(nomes_clientes(&est), vec!["Cliente do backup".to_string()]);
+        let depois = rusqlite::Connection::open(dir.join("oficina.db")).unwrap();
+        let nomes: Vec<String> = depois.prepare("SELECT nome FROM clientes").unwrap().query_map([], |r| r.get(0)).unwrap().map(|n| n.unwrap()).collect();
+        assert_eq!(nomes, vec!["Cliente do backup".to_string()], "o banco restaurado não pode voltar ao antigo");
     }
 
     #[test]
