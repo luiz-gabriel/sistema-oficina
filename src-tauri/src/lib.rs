@@ -6,6 +6,7 @@ mod rede;
 mod servico;
 mod servidor;
 mod sincronia;
+mod web;
 
 use std::sync::Arc;
 
@@ -18,13 +19,22 @@ use tauri::{Manager, State};
 type Est<'a> = State<'a, Arc<Estado>>;
 
 /// Liga ou desliga a rede conforme o modo. Só "servidor" e "cliente" abrem escuta e conexões;
-/// "local" e modo ainda não escolhido não abrem porta nenhuma.
+/// "local" e modo ainda não escolhido não abrem porta nenhuma. O servidor web acompanha a mesma regra.
 fn ajustar_rede(est: &Arc<Estado>) {
     if modo_usa_rede(&est.modo()) {
         sincronia::iniciar(est.clone());
+        if let Err(e) = web::iniciar(est, web::pasta_ui()) {
+            eprintln!("aviso: {e}");
+        }
     } else {
         rede::parar_escuta(est.porta);
+        web::parar(est);
     }
+}
+
+#[tauri::command]
+fn web_status(est: Est) -> Value {
+    est.web.situacao()
 }
 
 #[tauri::command]
@@ -249,7 +259,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            estado_sistema, ativar_sistema, criar_administrador, login, logout, comando,
+            web_status, estado_sistema, ativar_sistema, criar_administrador, login, logout, comando,
             config_obter, config_modo, rede_buscar, sincronizar_agora, trabalhar_offline,
             pendencias, historico, resolver_conflito, versoes_conflito, backup_agora, exportar_dados,
             backup_validar_arquivo, backup_restaurar,

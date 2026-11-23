@@ -34,6 +34,8 @@ pub struct Estado {
     pub dir: PathBuf,
     pub porta: u16,
     pub computador: String,
+    /// Servidor web local (navegador da rede local). Ver `web`.
+    pub web: crate::web::Web,
 }
 
 impl Estado {
@@ -58,6 +60,7 @@ impl Estado {
             dir,
             porta,
             computador,
+            web: Default::default(),
         }
     }
 
