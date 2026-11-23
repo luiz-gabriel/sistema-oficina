@@ -44,11 +44,19 @@ struct Login {
 }
 
 #[derive(Deserialize)]
-struct EnvioPedido {
+struct IniciarPareamento {
     #[serde(default)]
-    codigo: String,
+    msg: String,
+}
+
+#[derive(Deserialize)]
+struct ConfirmarPareamento {
+    #[serde(default)]
+    sessao: i64,
     #[serde(default)]
     nome: String,
+    #[serde(default)]
+    mac: String,
 }
 
 #[derive(Deserialize)]
@@ -56,7 +64,7 @@ struct ConsultaPedido {
     #[serde(default)]
     pedido_id: i64,
     #[serde(default)]
-    segredo: String,
+    prova: String,
 }
 
 pub fn tratar(est: &Estado, req: &Requisicao) -> Resposta {
@@ -266,12 +274,13 @@ fn logout(est: &Estado, req: &Requisicao) -> Resposta {
 }
 
 /// Rotas de dispositivos e pareamento. As duas de pareamento são públicas (o aparelho ainda não tem credencial):
-/// só aceitam código válido ou segredo do pedido. As demais exigem administrador.
+/// só aceitam código (pelo SPAKE2) ou prova do pedido. As demais exigem administrador.
 fn dispositivos_rota(est: &Estado, req: &Requisicao) -> Resposta {
     let metodo = req.metodo.as_str();
     let partes: Vec<&str> = req.caminho.trim_start_matches("/api/").split('/').collect();
     match (metodo, partes.as_slice()) {
-        ("POST", ["pareamento", "pedidos"]) => return pareamento_enviar(est, req),
+        ("POST", ["pareamento", "iniciar"]) => return pareamento_iniciar(est, req),
+        ("POST", ["pareamento", "confirmar"]) => return pareamento_confirmar(est, req),
         ("POST", ["pareamento", "consultar"]) => return pareamento_consultar(est, req),
         _ => {}
     }
@@ -320,13 +329,31 @@ fn iniciar_pareamento(est: &Estado, ctx: &Contexto) -> Resposta {
     Resposta::json(200, &valor)
 }
 
-fn pareamento_enviar(est: &Estado, req: &Requisicao) -> Resposta {
-    let Ok(dados) = serde_json::from_slice::<EnvioPedido>(&req.corpo) else {
-        return Resposta::erro(400, "validation", "Informe o código e o nome do aparelho.");
+/// Passo 1 do pareamento (rota pública): o aparelho envia a mensagem SPAKE2 e recebe a resposta.
+fn pareamento_iniciar(est: &Estado, req: &Requisicao) -> Resposta {
+    let msg = serde_json::from_slice::<IniciarPareamento>(&req.corpo).ok().and_then(|d| hex::decode(d.msg).ok());
+    let Some(msg) = msg else {
+        return Resposta::erro(400, "validation", "Dados de pareamento inválidos.");
     };
-    let r = est.db().and_then(|c| dispositivos::enviar_pedido(&c, &dados.codigo, &dados.nome, Utc::now()));
+    let r = est.db().and_then(|c| dispositivos::iniciar_sessao(&c, &msg, Utc::now()));
     match r {
-        Ok(p) => Resposta::json(200, &json!({"pedido_id": p.pedido_id, "segredo": p.segredo})),
+        Ok(s) => Resposta::json(200, &json!({"sessao": s.sessao_id, "msg": hex::encode(s.msg_servidor)})),
+        Err(e) => erro_app(e),
+    }
+}
+
+/// Passo 2 do pareamento (rota pública): o aparelho prova que conhece o código (MAC). Só então
+/// o pedido é criado e o principal devolve o próprio MAC.
+fn pareamento_confirmar(est: &Estado, req: &Requisicao) -> Resposta {
+    let Ok(dados) = serde_json::from_slice::<ConfirmarPareamento>(&req.corpo) else {
+        return Resposta::erro(400, "validation", "Dados de pareamento inválidos.");
+    };
+    let Ok(mac) = hex::decode(&dados.mac) else {
+        return Resposta::erro(400, "validation", "Dados de pareamento inválidos.");
+    };
+    let r = est.db().and_then(|c| dispositivos::confirmar_sessao(&c, dados.sessao, &dados.nome, &mac, Utc::now()));
+    match r {
+        Ok(c) => Resposta::json(200, &json!({"pedido_id": c.pedido_id, "mac": hex::encode(c.mac_servidor)})),
         Err(e) => erro_app(e),
     }
 }
@@ -334,13 +361,15 @@ fn pareamento_enviar(est: &Estado, req: &Requisicao) -> Resposta {
 /// O aparelho acompanha o pedido. O token sai só uma vez, na entrega.
 fn pareamento_consultar(est: &Estado, req: &Requisicao) -> Resposta {
     let Ok(dados) = serde_json::from_slice::<ConsultaPedido>(&req.corpo) else {
-        return Resposta::erro(400, "validation", "Informe o pedido e o segredo.");
+        return Resposta::erro(400, "validation", "Informe o pedido e a prova.");
     };
-    let r = est.db().and_then(|c| dispositivos::consultar_pedido(&c, dados.pedido_id, &dados.segredo, Utc::now()));
+    let r = est.db().and_then(|c| dispositivos::consultar_pedido(&c, dados.pedido_id, &dados.prova, Utc::now()));
     match r {
         Ok(dispositivos::Consulta::Pendente) => Resposta::json(200, &json!({"situacao": "PENDENTE"})),
         Ok(dispositivos::Consulta::Recusado) => Resposta::json(200, &json!({"situacao": "RECUSADO"})),
-        Ok(dispositivos::Consulta::Liberado { token }) => Resposta::json(200, &json!({"situacao": "LIBERADO", "token": token})),
+        Ok(dispositivos::Consulta::Liberado { token_cifrado }) => {
+            Resposta::json(200, &json!({"situacao": "LIBERADO", "token_cifrado": token_cifrado}))
+        }
         Ok(dispositivos::Consulta::JaEntregue) => Resposta::json(200, &json!({"situacao": "JA_ENTREGUE"})),
         Err(e) => erro_app(e),
     }
@@ -381,6 +410,7 @@ fn erro_app(e: AppError) -> Resposta {
 #[cfg(test)]
 mod testes {
     use super::*;
+    use oficina_core::pareamento_pake as pake;
     use oficina_core::{db, funcionarios::{AcessoInput, FuncionarioInput}};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -592,13 +622,22 @@ mod testes {
         let codigo = json_do(&cod)["codigo"].as_str().unwrap().to_string();
         assert_eq!(codigo.len(), 6);
         assert_eq!(json_do(&cod)["endereco"], Value::Null, "sem servidor ligado o endereço fica vazio");
-        // Aparelho envia o código (rota pública).
-        let envio = pedir(&est, &post("/api/pareamento/pedidos", None, &format!(r#"{{"codigo":"{codigo}","nome":"Celular da Ana"}}"#)));
-        assert_eq!(status(&envio), 200, "{envio}");
-        let pedido = json_do(&envio);
-        let (pedido_id, segredo) = (pedido["pedido_id"].as_i64().unwrap(), pedido["segredo"].as_str().unwrap().to_string());
+        // Aparelho pareia por SPAKE2 (rotas públicas): a senha é o código, que nunca vai em claro.
+        let (iniciado, msg_c) = pake::cliente_iniciar(&codigo);
+        let sessao = json_do(&pedir(&est, &post("/api/pareamento/iniciar", None, &format!(r#"{{"msg":"{}"}}"#, hex::encode(&msg_c)))));
+        let msg_s = hex::decode(sessao["msg"].as_str().unwrap()).unwrap();
+        let chave = pake::cliente_concluir(iniciado, &msg_s).unwrap();
+        let mac_c = pake::confirmar_cliente(&chave, &msg_c, &msg_s);
+        let corpo = format!(r#"{{"sessao":{},"nome":"Celular da Ana","mac":"{}"}}"#, sessao["sessao"], hex::encode(&mac_c));
+        let confirmado = pedir(&est, &post("/api/pareamento/confirmar", None, &corpo));
+        assert_eq!(status(&confirmado), 200, "{confirmado}");
+        let pedido = json_do(&confirmado);
+        let pedido_id = pedido["pedido_id"].as_i64().unwrap();
+        let mac_s = hex::decode(pedido["mac"].as_str().unwrap()).unwrap();
+        assert!(pake::conferir_servidor(&chave, &msg_c, &msg_s, &mac_s), "o principal deve provar a chave");
+        let prova = pake::provar_consulta(&chave, pedido_id);
+        let consulta = format!(r#"{{"pedido_id":{pedido_id},"prova":"{prova}"}}"#);
         // Enquanto não aprovado, o aparelho só vê PENDENTE.
-        let consulta = format!(r#"{{"pedido_id":{pedido_id},"segredo":"{segredo}"}}"#);
         assert_eq!(json_do(&pedir(&est, &post("/api/pareamento/consultar", None, &consulta)))["situacao"], "PENDENTE");
         // Administrador vê o pedido e aprova.
         let pendentes = json_do(&pedir(&est, &get("/api/dispositivos/pedidos", Some(&admin))));
@@ -608,7 +647,8 @@ mod testes {
         // Aparelho recebe o token uma vez.
         let liberado = json_do(&pedir(&est, &post("/api/pareamento/consultar", None, &consulta)));
         assert_eq!(liberado["situacao"], "LIBERADO");
-        let token = liberado["token"].as_str().unwrap().to_string();
+        assert!(!liberado.to_string().contains("\"token\""), "token nunca sai em claro");
+        let token = pake::decifrar_token(&chave, liberado["token_cifrado"].as_str().unwrap()).unwrap();
         assert_eq!(json_do(&pedir(&est, &post("/api/pareamento/consultar", None, &consulta)))["situacao"], "JA_ENTREGUE");
         // Login do aparelho: vindo de outro computador, com o token certo, entra.
         let entrou = tratar(&est, &requisicao("POST", "/api/login", Some(&token), false, r#"{"usuario":"ana","senha":"segredo123"}"#));

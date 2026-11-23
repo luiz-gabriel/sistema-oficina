@@ -27,6 +27,7 @@ pub mod itens;
 pub mod ordens;
 pub mod orcamentos;
 pub mod painel;
+pub mod pareamento_pake;
 pub mod seguranca;
 pub mod sessao;
 pub mod sessoes;

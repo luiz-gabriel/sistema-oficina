@@ -9,6 +9,7 @@ use oficina_core::comandos::{self, Contexto};
 use oficina_core::dispositivos::{self, Consulta, LIMITE_DISPOSITIVOS};
 use oficina_core::error::AppError;
 use oficina_core::funcionarios::{self, AcessoInput, FuncionarioInput};
+use oficina_core::pareamento_pake;
 use oficina_core::seguranca::sha256_hex;
 use oficina_core::{db, sessoes};
 use rusqlite::Connection;
@@ -22,11 +23,21 @@ fn caminho_banco() -> PathBuf {
     std::env::temp_dir().join(format!("oficina_disp_{}.db", uuid::Uuid::new_v4()))
 }
 
-/// Cria um pedido PENDENTE: inicia o pareamento e o aparelho envia o código.
+/// Cria um pedido PENDENTE: inicia o pareamento e o aparelho pareia por SPAKE2 com o código.
+/// Devolve o pedido e a prova de consulta (só vale com a chave da sessão).
 fn pedido(conn: &Connection, nome: &str, agora: DateTime<Utc>) -> (i64, String) {
     let c = dispositivos::iniciar_pareamento(conn, agora).unwrap();
-    let p = dispositivos::enviar_pedido(conn, &c.codigo, nome, agora).unwrap();
-    (p.pedido_id, p.segredo)
+    let p = dispositivos::parear_aparelho(conn, &c.codigo, nome, agora).unwrap();
+    (p.pedido_id, pareamento_pake::provar_consulta(&p.chave, p.pedido_id))
+}
+
+/// Decifra o token entregue usando a chave de transporte guardada no pedido.
+fn token_de(conn: &Connection, pedido_id: i64, cifrado: &str) -> String {
+    let chave_hex: String = conn
+        .query_row("SELECT chave_transporte FROM pedidos_pareamento WHERE id = ?1", [pedido_id], |r| r.get(0))
+        .unwrap();
+    let chave = hex::decode(chave_hex).unwrap();
+    pareamento_pake::decifrar_token(&chave, cifrado).unwrap()
 }
 
 fn contar_ativos(conn: &Connection) -> i64 {
@@ -131,7 +142,7 @@ fn codigo_expira_em_cinco_minutos() {
     let conn = db::open_in_memory().unwrap();
     let c = dispositivos::iniciar_pareamento(&conn, t0()).unwrap();
     let no_limite = t0() + Duration::minutes(5);
-    let erro = dispositivos::enviar_pedido(&conn, &c.codigo, "Celular", no_limite).unwrap_err();
+    let erro = dispositivos::parear_aparelho(&conn, &c.codigo, "Celular", no_limite).unwrap_err();
     assert!(matches!(erro, AppError::Validation(_)), "{erro:?}");
     assert!(dispositivos::listar_pedidos_pendentes(&conn).unwrap().is_empty());
 }
@@ -141,7 +152,7 @@ fn codigo_ainda_vale_um_segundo_antes_de_expirar() {
     let conn = db::open_in_memory().unwrap();
     let c = dispositivos::iniciar_pareamento(&conn, t0()).unwrap();
     let antes = t0() + Duration::minutes(5) - Duration::seconds(1);
-    assert!(dispositivos::enviar_pedido(&conn, &c.codigo, "Celular", antes).is_ok());
+    assert!(dispositivos::parear_aparelho(&conn, &c.codigo, "Celular", antes).is_ok());
 }
 
 #[test]
@@ -149,8 +160,8 @@ fn codigo_usado_nao_serve_de_novo() {
     let conn = db::open_in_memory().unwrap();
     let agora = t0();
     let c = dispositivos::iniciar_pareamento(&conn, agora).unwrap();
-    dispositivos::enviar_pedido(&conn, &c.codigo, "Celular da Ana", agora).unwrap();
-    let de_novo = dispositivos::enviar_pedido(&conn, &c.codigo, "Outro aparelho", agora).unwrap_err();
+    dispositivos::parear_aparelho(&conn, &c.codigo, "Celular da Ana", agora).unwrap();
+    let de_novo = dispositivos::parear_aparelho(&conn, &c.codigo, "Outro aparelho", agora).unwrap_err();
     assert!(matches!(de_novo, AppError::Validation(_)), "{de_novo:?}");
     assert_eq!(dispositivos::listar_pedidos_pendentes(&conn).unwrap().len(), 1);
 }
@@ -161,13 +172,13 @@ fn tres_erradas_bloqueiam_o_codigo() {
     let agora = t0();
     let c = dispositivos::iniciar_pareamento(&conn, agora).unwrap();
     let errado = if c.codigo == "000000" { "111111" } else { "000000" };
-    let primeira = dispositivos::enviar_pedido(&conn, errado, "Celular", agora).unwrap_err();
+    let primeira = dispositivos::parear_aparelho(&conn, errado, "Celular", agora).unwrap_err();
     assert!(format!("{primeira:?}").contains("Restam 2"), "{primeira:?}");
-    dispositivos::enviar_pedido(&conn, errado, "Celular", agora).unwrap_err();
-    let terceira = dispositivos::enviar_pedido(&conn, errado, "Celular", agora).unwrap_err();
+    dispositivos::parear_aparelho(&conn, errado, "Celular", agora).unwrap_err();
+    let terceira = dispositivos::parear_aparelho(&conn, errado, "Celular", agora).unwrap_err();
     assert!(format!("{terceira:?}").contains("bloqueado"), "{terceira:?}");
     // Depois de bloqueado, nem o código certo serve.
-    let certo = dispositivos::enviar_pedido(&conn, &c.codigo, "Celular", agora).unwrap_err();
+    let certo = dispositivos::parear_aparelho(&conn, &c.codigo, "Celular", agora).unwrap_err();
     assert!(matches!(certo, AppError::Validation(_)), "{certo:?}");
     assert!(dispositivos::listar_pedidos_pendentes(&conn).unwrap().is_empty());
 }
@@ -178,9 +189,9 @@ fn duas_erradas_ainda_deixam_acertar() {
     let agora = t0();
     let c = dispositivos::iniciar_pareamento(&conn, agora).unwrap();
     let errado = if c.codigo == "000000" { "111111" } else { "000000" };
-    dispositivos::enviar_pedido(&conn, errado, "Celular", agora).unwrap_err();
-    dispositivos::enviar_pedido(&conn, errado, "Celular", agora).unwrap_err();
-    assert!(dispositivos::enviar_pedido(&conn, &c.codigo, "Celular", agora).is_ok());
+    dispositivos::parear_aparelho(&conn, errado, "Celular", agora).unwrap_err();
+    dispositivos::parear_aparelho(&conn, errado, "Celular", agora).unwrap_err();
+    assert!(dispositivos::parear_aparelho(&conn, &c.codigo, "Celular", agora).is_ok());
 }
 
 #[test]
@@ -195,8 +206,8 @@ fn novo_codigo_substitui_o_anterior() {
             break n;
         }
     };
-    assert!(dispositivos::enviar_pedido(&conn, &antigo.codigo, "Celular", agora).is_err());
-    assert!(dispositivos::enviar_pedido(&conn, &novo.codigo, "Celular", agora).is_ok());
+    assert!(dispositivos::parear_aparelho(&conn, &antigo.codigo, "Celular", agora).is_err());
+    assert!(dispositivos::parear_aparelho(&conn, &novo.codigo, "Celular", agora).is_ok());
 }
 
 #[test]
@@ -220,7 +231,7 @@ fn token_entregue_uma_vez_e_so_o_hash_fica_no_banco() {
     let d = dispositivos::aprovar_pedido(&conn, id, "PC", agora).unwrap();
     assert!(!d.principal);
     let token = match dispositivos::consultar_pedido(&conn, id, &segredo, agora).unwrap() {
-        Consulta::Liberado { token } => token,
+        Consulta::Liberado { token_cifrado } => token_de(&conn, id, &token_cifrado),
         outra => panic!("esperava o token, veio {outra:?}"),
     };
     assert_eq!(token.len(), 64);
@@ -256,7 +267,7 @@ fn revogacao_libera_vaga_e_invalida_sessoes_do_aparelho() {
         let (pid, segredo) = pedido(&conn, &format!("Aparelho {i}"), agora);
         let d = dispositivos::aprovar_pedido(&conn, pid, "PC", agora).unwrap();
         let token = match dispositivos::consultar_pedido(&conn, pid, &segredo, agora).unwrap() {
-            Consulta::Liberado { token } => token,
+            Consulta::Liberado { token_cifrado } => token_de(&conn, pid, &token_cifrado),
             outra => panic!("{outra:?}"),
         };
         ids.push((d.id, token));
@@ -347,4 +358,80 @@ fn principal_e_listado_primeiro_e_sem_segredos() {
     assert_eq!(lista[1].nome, "Celular");
     assert_eq!(lista[1].situacao, "ATIVO");
     assert!(lista[1].autorizado_em.is_some());
+}
+
+#[test]
+fn sessao_de_pareamento_so_serve_uma_vez() {
+    let conn = db::open_in_memory().unwrap();
+    let agora = t0();
+    dispositivos::garantir_principal(&conn, "PC", agora).unwrap();
+    let c = dispositivos::iniciar_pareamento(&conn, agora).unwrap();
+    let (iniciado, msg_c) = pareamento_pake::cliente_iniciar(&c.codigo);
+    let sessao = dispositivos::iniciar_sessao(&conn, &msg_c, agora).unwrap();
+    let chave = pareamento_pake::cliente_concluir(iniciado, &sessao.msg_servidor).unwrap();
+    let mac = pareamento_pake::confirmar_cliente(&chave, &msg_c, &sessao.msg_servidor);
+    dispositivos::confirmar_sessao(&conn, sessao.sessao_id, "Celular", &mac, agora).unwrap();
+    let de_novo = dispositivos::confirmar_sessao(&conn, sessao.sessao_id, "Celular", &mac, agora).unwrap_err();
+    assert!(matches!(de_novo, AppError::Validation(_)), "{de_novo:?}");
+}
+
+#[test]
+fn mac_errado_gasta_tentativa_e_nao_cria_pedido() {
+    let conn = db::open_in_memory().unwrap();
+    let agora = t0();
+    dispositivos::garantir_principal(&conn, "PC", agora).unwrap();
+    let c = dispositivos::iniciar_pareamento(&conn, agora).unwrap();
+    let (_iniciado, msg_c) = pareamento_pake::cliente_iniciar("000000");
+    let sessao = dispositivos::iniciar_sessao(&conn, &msg_c, agora).unwrap();
+    let falso = vec![0u8; 32];
+    let erro = dispositivos::confirmar_sessao(&conn, sessao.sessao_id, "Celular", &falso, agora).unwrap_err();
+    let AppError::Validation(campos) = &erro else { panic!("{erro:?}") };
+    assert!(campos[0].message.contains("Restam 2"), "{erro:?}");
+    let pedidos: i64 = conn.query_row("SELECT COUNT(*) FROM pedidos_pareamento", [], |r| r.get(0)).unwrap();
+    assert_eq!(pedidos, 0);
+    let erradas: i64 = conn
+        .query_row("SELECT tentativas_erradas FROM codigos_pareamento ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(erradas, 1, "o código {} segue ativo, com uma tentativa gasta", c.codigo);
+}
+
+#[test]
+fn codigo_em_claro_some_do_banco_depois_de_usado() {
+    let conn = db::open_in_memory().unwrap();
+    let agora = t0();
+    dispositivos::garantir_principal(&conn, "PC", agora).unwrap();
+    let c = dispositivos::iniciar_pareamento(&conn, agora).unwrap();
+    let guardado: Option<String> = conn
+        .query_row("SELECT codigo_pake FROM codigos_pareamento ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(guardado.as_deref(), Some(c.codigo.as_str()), "enquanto ativo, o SPAKE2 precisa do código");
+    dispositivos::parear_aparelho(&conn, &c.codigo, "Celular", agora).unwrap();
+    let depois: Option<String> = conn
+        .query_row("SELECT codigo_pake FROM codigos_pareamento ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(depois, None);
+}
+
+#[test]
+fn sessao_de_codigo_substituido_nao_confirma() {
+    let conn = db::open_in_memory().unwrap();
+    let agora = t0();
+    dispositivos::garantir_principal(&conn, "PC", agora).unwrap();
+    let antigo = dispositivos::iniciar_pareamento(&conn, agora).unwrap();
+    let (iniciado, msg_c) = pareamento_pake::cliente_iniciar(&antigo.codigo);
+    let sessao = dispositivos::iniciar_sessao(&conn, &msg_c, agora).unwrap();
+    let chave = pareamento_pake::cliente_concluir(iniciado, &sessao.msg_servidor).unwrap();
+    let mac = pareamento_pake::confirmar_cliente(&chave, &msg_c, &sessao.msg_servidor);
+    dispositivos::iniciar_pareamento(&conn, agora).unwrap();
+    assert!(dispositivos::confirmar_sessao(&conn, sessao.sessao_id, "Celular", &mac, agora).is_err());
+}
+
+#[test]
+fn consulta_sem_prova_valida_nao_mostra_o_pedido() {
+    let conn = db::open_in_memory().unwrap();
+    let agora = t0();
+    dispositivos::garantir_principal(&conn, "PC", agora).unwrap();
+    let (id, _prova) = pedido(&conn, "Celular", agora);
+    let outra_prova = pareamento_pake::provar_consulta(&[1u8; 32], id);
+    assert!(dispositivos::consultar_pedido(&conn, id, &outra_prova, agora).is_err());
 }

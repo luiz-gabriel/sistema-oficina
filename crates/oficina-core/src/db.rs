@@ -288,6 +288,7 @@ CREATE TABLE IF NOT EXISTS pedidos_pareamento (
   criado_em      TEXT NOT NULL,
   situacao       TEXT NOT NULL CHECK (situacao IN ('PENDENTE', 'APROVADO', 'RECUSADO', 'ENTREGUE')),
   segredo_hash   TEXT NOT NULL,
+  chave_transporte TEXT,
   dispositivo_id INTEGER REFERENCES dispositivos(id),
   decidido_em    TEXT
 );
@@ -299,7 +300,18 @@ CREATE TABLE IF NOT EXISTS codigos_pareamento (
   criado_em          TEXT NOT NULL,
   expira_em          INTEGER NOT NULL,
   tentativas_erradas INTEGER NOT NULL DEFAULT 0 CHECK (tentativas_erradas >= 0),
-  situacao           TEXT NOT NULL CHECK (situacao IN ('ATIVO', 'USADO', 'BLOQUEADO', 'EXPIRADO', 'SUBSTITUIDO'))
+  situacao           TEXT NOT NULL CHECK (situacao IN ('ATIVO', 'USADO', 'BLOQUEADO', 'EXPIRADO', 'SUBSTITUIDO')),
+  codigo_pake        TEXT
+);
+-- Sessões de pareamento (SPAKE2) abertas pelo PC secundário. A chave de sessão some ao concluir.
+CREATE TABLE IF NOT EXISTS pareamentos_em_andamento (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  codigo_id    INTEGER NOT NULL REFERENCES codigos_pareamento(id),
+  msg_cliente  TEXT NOT NULL,
+  msg_servidor TEXT NOT NULL,
+  chave        TEXT NOT NULL,
+  expira_em    INTEGER NOT NULL,
+  situacao     TEXT NOT NULL CHECK (situacao IN ('ABERTA', 'CONCLUIDA', 'FALHOU'))
 );
 -- Sessões de login no servidor web. Validade absoluta: `expira_em` (segundos Unix) nunca é estendido pelo uso.
 CREATE TABLE IF NOT EXISTS sessoes (
@@ -395,12 +407,30 @@ fn migrar(conn: &Connection) -> AppResult<()> {
         )?;
     }
     migrar_contas_pagar_compra(conn)?;
+    migrar_pareamento_pake(conn)?;
     Ok(())
 }
 
 /// Compra a prazo: a conta passa a ser só `contas_pagar` (com `compra_id`). Converte as linhas antigas de
 /// `contas_pagar_compra` que ainda não têm conta com o mesmo `compra_id`. Se a antiga estava paga (pago = 1),
 /// lança um pagamento com o valor total e a data da compra. Idempotente. A tabela antiga não é apagada.
+/// Pareamento por SPAKE2: colunas novas em bancos criados antes da troca do código.
+fn migrar_pareamento_pake(conn: &Connection) -> AppResult<()> {
+    let colunas = |tabela: &str| -> AppResult<Vec<String>> {
+        Ok(conn
+            .prepare(&format!("PRAGMA table_info({tabela})"))?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?)
+    };
+    if !colunas("codigos_pareamento")?.iter().any(|c| c == "codigo_pake") {
+        conn.execute_batch("ALTER TABLE codigos_pareamento ADD COLUMN codigo_pake TEXT;")?;
+    }
+    if !colunas("pedidos_pareamento")?.iter().any(|c| c == "chave_transporte") {
+        conn.execute_batch("ALTER TABLE pedidos_pareamento ADD COLUMN chave_transporte TEXT;")?;
+    }
+    Ok(())
+}
+
 fn migrar_contas_pagar_compra(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(
         "INSERT INTO contas_pagar (descricao, fornecedor, compra_id, valor_centavos, vencimento, data, usuario)
