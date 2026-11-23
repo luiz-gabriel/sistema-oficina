@@ -249,10 +249,8 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
-            let conn = oficina_core::db::open(&dir.join("oficina.db"))
-                .map_err(|e| format!("não foi possível abrir o banco: {e}"))?;
             let porta = std::env::var("OFICINA_PORTA").ok().and_then(|p| p.parse().ok()).unwrap_or(7878);
-            let est = Arc::new(Estado::novo(conn, dir, porta));
+            let est = Arc::new(Estado::novo(dir, porta).map_err(|e| format!("não foi possível abrir o banco: {e}"))?);
             ajustar_rede(&est);
             backup::iniciar_automatico(est.clone());
             app.manage(est);

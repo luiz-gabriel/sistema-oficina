@@ -21,3 +21,5 @@ serde_json = "1"
 base64 = "0.22"
 escpos = "0.20"
 spake2 = { version = "=0.5.0-pre.0", features = ["getrandom"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"

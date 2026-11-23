@@ -35,6 +35,24 @@ const LEITURAS: &[Leitura] = &[
     Leitura { caminho: "/api/caixa/situacao", comando: "caixa_situacao", com_id: false },
 ];
 
+/// Listas grandes que a web lê em blocos (`?limite=&deslocamento=`). As rotas sem `/pagina` continuam
+/// devolvendo a lista inteira, usada pelos campos de escolha (ex.: escolher a peça numa venda).
+const PAGINADAS: &[(&str, &str)] = &[
+    ("/api/clientes/pagina", "clientes_pagina"),
+    ("/api/veiculos/pagina", "veiculos_pagina"),
+    ("/api/itens/pagina", "itens_pagina"),
+    ("/api/ordens/pagina", "ordens_pagina"),
+];
+
+/// Valor de um parâmetro numérico da query string. Ausente ou inválido vira `None` (a paginação corrige).
+fn parametro_numero(consulta: Option<&str>, nome: &str) -> Option<i64> {
+    consulta?
+        .split('&')
+        .filter_map(|par| par.split_once('='))
+        .find(|(k, _)| *k == nome)
+        .and_then(|(_, v)| v.parse::<i64>().ok())
+}
+
 #[derive(Deserialize)]
 struct Login {
     #[serde(default)]
@@ -83,6 +101,12 @@ pub fn tratar(est: &Estado, req: &Requisicao) -> Resposta {
     }
     if caminho.starts_with("/api/dispositivos") || caminho.starts_with("/api/pareamento/") {
         return dispositivos_rota(est, req);
+    }
+    if let Some((_, comando)) = PAGINADAS.iter().find(|(c, _)| *c == caminho) {
+        if metodo != "GET" {
+            return metodo_errado();
+        }
+        return leitura_paginada(est, req, comando);
     }
     for rota in LEITURAS {
         let id = if rota.com_id {
@@ -145,6 +169,23 @@ fn exigir_administrador(est: &Estado, req: &Requisicao) -> Result<Contexto, Resp
         return Err(Resposta::erro(403, "conflict", "Só o administrador pode gerenciar dispositivos."));
     }
     Ok(ctx)
+}
+
+fn leitura_paginada(est: &Estado, req: &Requisicao, comando: &str) -> Resposta {
+    let ctx = match exigir_sessao(est, req) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let consulta = req.consulta.as_deref();
+    let args = json!({
+        "limite": parametro_numero(consulta, "limite"),
+        "deslocamento": parametro_numero(consulta, "deslocamento"),
+    });
+    let resultado = est.db().map_err(erro_app).and_then(|c| comandos::executar(&c, comando, &args, &ctx).map_err(erro_app));
+    match resultado {
+        Ok(valor) => Resposta::json(200, &valor),
+        Err(r) => r,
+    }
 }
 
 fn leitura(est: &Estado, req: &Requisicao, rota: &Leitura, id: i64) -> Resposta {
@@ -414,15 +455,16 @@ fn erro_app(e: AppError) -> Resposta {
 mod testes {
     use super::*;
     use oficina_core::pareamento_pake as pake;
-    use oficina_core::{db, funcionarios::{AcessoInput, FuncionarioInput}};
+    use oficina_core::funcionarios::{AcessoInput, FuncionarioInput};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
 
     fn estado_de_teste() -> Arc<Estado> {
         let dir = std::env::temp_dir().join(format!("oficina_web_teste_{}_{}", std::process::id(), rand_id()));
-        let conn = db::open_in_memory().expect("banco em memória");
+        let est = Estado::novo(dir, 0).expect("banco de teste");
         {
+            let conn = est.db().unwrap();
             let f = funcionarios::criar(&conn, &FuncionarioInput { nome: Some("Ana".into()), cargo: Some("Gerente".into()), telefone: None }).unwrap();
             funcionarios::dar_acesso(&conn, f.id, &AcessoInput {
                 login: Some("ana".into()),
@@ -432,7 +474,7 @@ mod testes {
             })
             .unwrap();
         }
-        Arc::new(Estado::novo(conn, dir, 0))
+        Arc::new(est)
     }
 
     fn rand_id() -> u32 {
@@ -521,6 +563,25 @@ mod testes {
     }
 
     #[test]
+    fn lista_paginada_pela_web_respeita_limite_e_deslocamento() {
+        let est = estado_de_teste();
+        {
+            let c = est.db().unwrap();
+            for i in 0..5 {
+                c.execute("INSERT INTO clientes (nome) VALUES (?1)", [format!("Cliente {i}")]).unwrap();
+            }
+        }
+        let cookie = token_do_cookie(&pedir(&est, &login_pedido("segredo123")));
+        let primeiro = pedir(&est, &get("/api/clientes/pagina?limite=2&deslocamento=0", Some(&cookie)));
+        assert_eq!(status(&primeiro), 200, "{primeiro}");
+        assert_eq!(corpo(&primeiro).matches("\"nome\"").count(), 2);
+        let ultimo = pedir(&est, &get("/api/clientes/pagina?limite=2&deslocamento=4", Some(&cookie)));
+        assert_eq!(corpo(&ultimo).matches("\"nome\"").count(), 1);
+        let sem_login = pedir(&est, &get("/api/clientes/pagina?limite=2", None));
+        assert_eq!(status(&sem_login), 401);
+    }
+
+    #[test]
     fn logout_invalida_o_cookie() {
         let est = estado_de_teste();
         let cookie = token_do_cookie(&pedir(&est, &login_pedido("segredo123")));
@@ -600,6 +661,7 @@ mod testes {
         Requisicao {
             metodo: metodo.into(),
             caminho: caminho.into(),
+            consulta: None,
             cookie: None,
             dispositivo: dispositivo.map(str::to_string),
             local,

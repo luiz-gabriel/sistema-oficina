@@ -60,6 +60,8 @@ pub struct Endereco {
 pub struct Requisicao {
     pub metodo: String,
     pub caminho: String,
+    /// Parte da URL depois do `?` (ex.: `limite=80&deslocamento=80`), sem decodificar.
+    pub consulta: Option<String>,
     pub cookie: Option<String>,
     /// Token do aparelho pareado (cabeçalho `X-Oficina-Dispositivo`), usado só no login.
     pub dispositivo: Option<String>,
@@ -267,6 +269,7 @@ async fn atender(State(ctx): State<Ctx>, ConnectInfo(origem): ConnectInfo<Socket
             let req = Requisicao {
                 metodo: partes.method.as_str().to_string(),
                 caminho: partes.uri.path().to_string(),
+                consulta: partes.uri.query().map(str::to_string),
                 cookie: partes
                     .headers
                     .get(header::COOKIE)

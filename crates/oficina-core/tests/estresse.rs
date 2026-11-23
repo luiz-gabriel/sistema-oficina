@@ -163,12 +163,23 @@ fn estresse_volume_sequencial() {
 
     // 5) Telas de listagem com o banco cheio (as listas não têm paginação).
     println!("== Listagens com o banco cheio");
-    for cmd in ["clientes_listar", "veiculos_listar", "itens_listar", "ordens_listar", "dashboard_resumo"] {
+    let listagens: [(&str, Value); 9] = [
+        ("clientes_listar", json!({})),
+        ("clientes_pagina", json!({"limite": 80, "deslocamento": 0})),
+        ("veiculos_listar", json!({})),
+        ("veiculos_pagina", json!({"limite": 80, "deslocamento": 0})),
+        ("itens_listar", json!({})),
+        ("itens_pagina", json!({"limite": 80, "deslocamento": 0})),
+        ("ordens_listar", json!({})),
+        ("ordens_pagina", json!({"limite": 80, "deslocamento": 0})),
+        ("dashboard_resumo", json!({})),
+    ];
+    for (cmd, args) in listagens {
         let mut tempos = Vec::new();
         let mut tamanho = 0usize;
         for _ in 0..5 {
             let t = Instant::now();
-            let v = executar(&conn, cmd, &json!({}), &ctx).unwrap();
+            let v = executar(&conn, cmd, &args, &ctx).unwrap();
             tempos.push(t.elapsed());
             tamanho = v.to_string().len();
         }

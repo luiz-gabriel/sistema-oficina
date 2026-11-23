@@ -254,6 +254,7 @@ function painelHistorico(veiculo) {
 
 export const render = crudPage({
   titulo: 'Veículos',
+  paginada: true,
   icone: 'veiculos',
   singular: 'veículo',
   descricao: 'Carros dos clientes. Ao alterar um veículo você pode anexar fotos dele.',

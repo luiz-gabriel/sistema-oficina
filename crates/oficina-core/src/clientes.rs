@@ -2,6 +2,7 @@ use rusqlite::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
+use crate::paginacao::Pagina;
 use crate::validation::Validator;
 
 #[derive(Debug, Clone, Serialize)]
@@ -56,6 +57,13 @@ fn validar(input: &ClienteInput) -> AppResult<ClienteInput> {
 pub fn listar(conn: &Connection) -> AppResult<Vec<Cliente>> {
     let mut stmt = conn.prepare(&format!("SELECT {COLUNAS} FROM clientes ORDER BY nome"))?;
     let rows = stmt.query_map([], de_linha)?.collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Um bloco da lista, na mesma ordem de `listar` (o id desempata nomes repetidos, para a paginação não repetir linhas).
+pub fn listar_pagina(conn: &Connection, pagina: Pagina) -> AppResult<Vec<Cliente>> {
+    let mut stmt = conn.prepare(&format!("SELECT {COLUNAS} FROM clientes ORDER BY nome, id LIMIT ?1 OFFSET ?2"))?;
+    let rows = stmt.query_map(params![pagina.limite, pagina.deslocamento], de_linha)?.collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 

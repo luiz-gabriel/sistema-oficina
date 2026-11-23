@@ -323,12 +323,43 @@ CREATE TABLE IF NOT EXISTS sessoes (
 );
 "#;
 
-/// Abre (ou cria) o banco de arquivo e aplica o esquema.
+/// Piscina de conexões ao banco de arquivo. Cada requisição pega uma conexão já aberta e a devolve ao terminar.
+pub type Piscina = r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>;
+/// Conexão emprestada da piscina (usa o mesmo `Connection` por baixo).
+pub type ConexaoPiscina = r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>;
+
+/// Abre (ou cria) o banco de arquivo, ativa o modo WAL e aplica o esquema.
 pub fn open(path: &Path) -> AppResult<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| crate::error::AppError::Database(e.to_string()))?;
     }
-    init(Connection::open(path)?)
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(TEMPO_ESPERA_BLOQUEIO)?;
+    // O WAL é gravado no arquivo, então vale para todas as conexões que vierem depois.
+    // Leituras deixam de esperar escritas, e uma escrita não bloqueia a tela que está lendo.
+    let modo: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+    if !modo.eq_ignore_ascii_case("wal") {
+        return Err(crate::error::AppError::Database(format!("não consegui ativar o modo WAL (modo atual: {modo})")));
+    }
+    init(conn)
+}
+
+/// Quanto tempo uma conexão espera por um bloqueio do banco antes de desistir.
+pub const TEMPO_ESPERA_BLOQUEIO: std::time::Duration = std::time::Duration::from_secs(5);
+/// Conexões abertas ao mesmo tempo. Leituras rodam em paralelo; escritas revezam pelo bloqueio do SQLite.
+pub const CONEXOES_NA_PISCINA: u32 = 8;
+
+/// Cria a piscina para um banco de arquivo já criado por `open`. Cada conexão nova ativa as chaves estrangeiras
+/// e o tempo de espera (são configurações por conexão, não do arquivo).
+pub fn piscina(path: &Path) -> AppResult<Piscina> {
+    let gerenciador = r2d2_sqlite::SqliteConnectionManager::file(path).with_init(|c| {
+        c.busy_timeout(TEMPO_ESPERA_BLOQUEIO)?;
+        c.execute_batch("PRAGMA foreign_keys = ON;")
+    });
+    r2d2::Pool::builder()
+        .max_size(CONEXOES_NA_PISCINA)
+        .build(gerenciador)
+        .map_err(|e| crate::error::AppError::Database(format!("não consegui abrir as conexões do banco: {e}")))
 }
 
 /// Banco em memória, usado nos testes.

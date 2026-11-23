@@ -197,10 +197,53 @@ pub fn buscar(conn: &Connection, id: i64) -> AppResult<Ordem> {
 pub fn listar(conn: &Connection) -> AppResult<Vec<Ordem>> {
     let mut stmt = conn.prepare(&format!("{SELECT_BASE} ORDER BY os.id DESC"))?;
     let mut ordens: Vec<Ordem> = stmt.query_map([], de_linha)?.collect::<Result<_, _>>()?;
-    for os in ordens.iter_mut() {
-        carregar_itens(conn, os)?;
-    }
+    carregar_itens_lote(conn, &mut ordens)?;
     Ok(ordens)
+}
+
+/// Um bloco da lista de ordens (mais novas primeiro), com os itens de todas as ordens do bloco em uma consulta.
+pub fn listar_pagina(conn: &Connection, pagina: crate::paginacao::Pagina) -> AppResult<Vec<Ordem>> {
+    let mut stmt = conn.prepare(&format!("{SELECT_BASE} ORDER BY os.id DESC LIMIT ?1 OFFSET ?2"))?;
+    let mut ordens: Vec<Ordem> = stmt.query_map(params![pagina.limite, pagina.deslocamento], de_linha)?.collect::<Result<_, _>>()?;
+    carregar_itens_lote(conn, &mut ordens)?;
+    Ok(ordens)
+}
+
+/// Carrega os itens de várias ordens de uma vez (antes era uma consulta por ordem).
+fn carregar_itens_lote(conn: &Connection, ordens: &mut [Ordem]) -> AppResult<()> {
+    if ordens.is_empty() {
+        return Ok(());
+    }
+    let marcas = vec!["?"; ordens.len()].join(",");
+    let sql = format!(
+        "SELECT oi.os_id, oi.item_id, i.nome, i.tipo, oi.quantidade, oi.preco_unitario, oi.subtotal
+         FROM ordem_itens oi JOIN itens i ON i.id = oi.item_id
+         WHERE oi.os_id IN ({marcas}) ORDER BY oi.id"
+    );
+    let ids: Vec<i64> = ordens.iter().map(|o| o.id).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let linhas = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            LinhaOrdem {
+                item_id: r.get(1)?,
+                item_nome: r.get(2)?,
+                tipo: r.get(3)?,
+                quantidade: r.get(4)?,
+                preco_unitario: r.get(5)?,
+                subtotal: r.get(6)?,
+            },
+        ))
+    })?;
+    let mut por_ordem: std::collections::HashMap<i64, Vec<LinhaOrdem>> = std::collections::HashMap::new();
+    for linha in linhas {
+        let (os_id, item) = linha?;
+        por_ordem.entry(os_id).or_default().push(item);
+    }
+    for os in ordens.iter_mut() {
+        os.itens = por_ordem.remove(&os.id).unwrap_or_default();
+    }
+    Ok(())
 }
 
 pub fn criar(conn: &Connection, input: &OrdemInput) -> AppResult<Ordem> {

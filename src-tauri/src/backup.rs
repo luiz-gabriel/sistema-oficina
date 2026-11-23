@@ -186,22 +186,28 @@ pub fn restaurar(est: &Estado, caminho: &str) -> AppResult<String> {
 
     let banco = est.dir.join("oficina.db");
     {
-        let mut guard = est.db()?;
-        // Fecha a conexão atual (troca por uma temporária em memória) antes de copiar o arquivo.
-        let antiga = std::mem::replace(&mut *guard, rusqlite::Connection::open_in_memory()?);
-        drop(antiga);
-        let trocar = || -> AppResult<rusqlite::Connection> {
+        // Espera as leituras e escritas em andamento terminarem (cada uma segura a trava) e fecha a piscina antiga.
+        let mut trava = est.piscina.write().map_err(|_| AppError::Database("conexão indisponível".into()))?;
+        *trava = None;
+        let abrir_novo = || -> AppResult<oficina_core::db::Piscina> {
+            limpar_wal(&banco);
             std::fs::copy(&origem, &banco).map_err(|e| AppError::Database(format!("não foi possível copiar o arquivo: {e}")))?;
-            oficina_core::db::open(&banco)
+            oficina_core::db::open(&banco)?;
+            oficina_core::db::piscina(&banco)
         };
-        match trocar() {
-            Ok(nova) => *guard = nova,
+        match abrir_novo() {
+            Ok(nova) => *trava = Some(nova),
             Err(erro) => {
+                limpar_wal(&banco);
                 let voltou = std::fs::copy(&seguranca, &banco).is_ok();
-                let reaberta = if voltou { oficina_core::db::open(&banco).ok() } else { None };
+                let reaberta = if voltou {
+                    oficina_core::db::open(&banco).ok().and_then(|_| oficina_core::db::piscina(&banco).ok())
+                } else {
+                    None
+                };
                 return match reaberta {
-                    Some(c) => {
-                        *guard = c;
+                    Some(p) => {
+                        *trava = Some(p);
                         Err(AppError::Database(format!("A restauração falhou e os dados anteriores foram mantidos. ({erro})")))
                     }
                     None => Err(AppError::Database(format!(
@@ -235,11 +241,20 @@ pub fn iniciar_automatico(est: Arc<Estado>) {
     });
 }
 
+/// Apaga os arquivos auxiliares do modo WAL (`-wal` e `-shm`) de um banco. Sem isso, o SQLite aplicaria
+/// ao arquivo restaurado mudanças que pertencem ao banco antigo.
+fn limpar_wal(banco: &Path) {
+    for sufixo in ["-wal", "-shm"] {
+        let mut nome = banco.as_os_str().to_owned();
+        nome.push(sufixo);
+        let _ = std::fs::remove_file(PathBuf::from(nome));
+    }
+}
+
 #[cfg(test)]
 mod testes {
     use super::*;
     use base64::Engine;
-    use oficina_core::db;
 
     fn pasta_temporaria(nome: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("oficina-bkp-{nome}-{}", std::process::id()));
@@ -249,9 +264,9 @@ mod testes {
     }
 
     fn estado_em(dir: &Path, cliente: &str) -> Estado {
-        let conn = db::open(&dir.join("oficina.db")).unwrap();
-        conn.execute("INSERT INTO clientes (nome) VALUES (?1)", [cliente]).unwrap();
-        Estado::novo(conn, dir.to_path_buf(), 7878)
+        let est = Estado::novo(dir.to_path_buf(), 7878).unwrap();
+        est.db().unwrap().execute("INSERT INTO clientes (nome) VALUES (?1)", [cliente]).unwrap();
+        est
     }
 
     fn nomes_clientes(est: &Estado) -> Vec<String> {
@@ -272,7 +287,7 @@ mod testes {
     #[test]
     fn arquivo_que_nao_e_banco_e_recusado() {
         let dir = pasta_temporaria("nao-banco");
-        let est = Estado::novo(db::open_in_memory().unwrap(), dir.clone(), 7878);
+        let est = Estado::novo(dir.clone(), 7878).unwrap();
         let b64 = base64::engine::general_purpose::STANDARD.encode(b"texto qualquer");
         assert!(validar_arquivo(&est, &b64).is_err());
     }
@@ -282,7 +297,7 @@ mod testes {
         let dir = pasta_temporaria("incompativel");
         let caminho = dir.join("velho.db");
         rusqlite::Connection::open(&caminho).unwrap().execute_batch("CREATE TABLE clientes (id INTEGER PRIMARY KEY, nome TEXT);").unwrap();
-        let est = Estado::novo(db::open_in_memory().unwrap(), dir.clone(), 7878);
+        let est = Estado::novo(dir.clone(), 7878).unwrap();
         let b64 = base64::engine::general_purpose::STANDARD.encode(std::fs::read(&caminho).unwrap());
         let err = validar_arquivo(&est, &b64).unwrap_err();
         assert!(err.to_string().contains("não é compatível"), "{err}");

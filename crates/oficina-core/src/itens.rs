@@ -72,6 +72,13 @@ pub fn listar(conn: &Connection) -> AppResult<Vec<Item>> {
     Ok(rows)
 }
 
+/// Um bloco da lista de peças e serviços, na mesma ordem de `listar`.
+pub fn listar_pagina(conn: &Connection, pagina: crate::paginacao::Pagina) -> AppResult<Vec<Item>> {
+    let mut stmt = conn.prepare(&format!("SELECT {COLUNAS} FROM itens ORDER BY nome, id LIMIT ?1 OFFSET ?2"))?;
+    let rows = stmt.query_map(rusqlite::params![pagina.limite, pagina.deslocamento], de_linha)?.collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 pub fn buscar(conn: &Connection, id: i64) -> AppResult<Item> {
     conn.query_row(&format!("SELECT {COLUNAS} FROM itens WHERE id = ?1"), [id], de_linha)
         .map_err(|_| AppError::NotFound("Item não encontrado.".into()))

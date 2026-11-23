@@ -3,12 +3,25 @@
 // Operações que dependem da máquina (impressora, nuvem, backup, arquivos) não existem no navegador: falham com aviso claro.
 const NO_APLICATIVO = typeof window !== 'undefined' && !!window.__TAURI__;
 
+// Bloco de uma lista paginada: `limite` e `deslocamento` viram a query string (o servidor corrige a faixa).
+const queryPagina = (a) => {
+  const p = new URLSearchParams();
+  if (a.limite != null) p.set('limite', String(a.limite));
+  if (a.deslocamento != null) p.set('deslocamento', String(a.deslocamento));
+  const q = p.toString();
+  return q ? `?${q}` : '';
+};
+
 // Leituras expostas pela web: nome do comando -> rota. Quem não estiver aqui não chega ao servidor pelo navegador.
 const LEITURAS_WEB = {
   clientes_listar: () => '/api/clientes',
   veiculos_listar: () => '/api/veiculos',
   itens_listar: () => '/api/itens',
   ordens_listar: () => '/api/ordens',
+  clientes_pagina: (a) => `/api/clientes/pagina${queryPagina(a)}`,
+  veiculos_pagina: (a) => `/api/veiculos/pagina${queryPagina(a)}`,
+  itens_pagina: (a) => `/api/itens/pagina${queryPagina(a)}`,
+  ordens_pagina: (a) => `/api/ordens/pagina${queryPagina(a)}`,
   ordens_buscar: (a) => `/api/ordens/${encodeURIComponent(a.id)}`,
   fornecedores_listar: () => '/api/fornecedores',
   funcionarios_listar: () => '/api/funcionarios',

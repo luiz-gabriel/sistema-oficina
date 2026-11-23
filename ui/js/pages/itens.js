@@ -3,6 +3,7 @@ import { moeda } from '../components.js';
 
 export const render = crudPage({
   titulo: 'Peças e Serviços',
+  paginada: true,
   icone: 'pecas',
   singular: 'peça ou serviço',
   descricao: 'Peças vendidas (controlam estoque) e serviços cobrados (mão de obra).',

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::clientes;
 use crate::error::{AppError, AppResult};
+use crate::paginacao::Pagina;
 use crate::validation::{is_placa_valida, normalize_placa, Validator};
 
 #[derive(Debug, Clone, Serialize)]
@@ -112,6 +113,13 @@ fn validar(conn: &Connection, input: &VeiculoInput) -> AppResult<Limpo> {
 pub fn listar(conn: &Connection) -> AppResult<Vec<Veiculo>> {
     let mut stmt = conn.prepare(&format!("{SELECT} ORDER BY v.placa"))?;
     let rows = stmt.query_map([], de_linha)?.collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Um bloco da lista de veículos, na mesma ordem de `listar`.
+pub fn listar_pagina(conn: &Connection, pagina: Pagina) -> AppResult<Vec<Veiculo>> {
+    let mut stmt = conn.prepare(&format!("{SELECT} ORDER BY v.placa, v.id LIMIT ?1 OFFSET ?2"))?;
+    let rows = stmt.query_map(rusqlite::params![pagina.limite, pagina.deslocamento], de_linha)?.collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 

@@ -7,6 +7,7 @@ export const render = crudPage({
   singular: 'cliente',
   descricao: 'Pessoas que trazem veículos para a oficina.',
   comando: 'clientes',
+  paginada: true,
   vazio: 'Nenhum cliente cadastrado ainda.',
   colunas: [{ key: 'nome', label: 'Nome' }, { key: 'telefone', label: 'Telefone' }, { key: 'email', label: 'E-mail' }],
   // Leva à aba Veículos já com este cliente como dono, com a busca do catálogo disponível.

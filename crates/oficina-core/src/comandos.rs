@@ -172,6 +172,11 @@ fn arg<T: DeserializeOwned>(args: &Value, chave: &str) -> AppResult<T> {
         .map_err(|e| AppError::Validation(vec![crate::error::FieldError { field: chave.into(), message: format!("dados inválidos: {e}") }]))
 }
 
+/// Bloco pedido pela tela (`limite` e `deslocamento` opcionais; a faixa é corrigida em `Pagina::nova`).
+fn pagina_de(args: &Value) -> crate::paginacao::Pagina {
+    crate::paginacao::Pagina::nova(args.get("limite").and_then(Value::as_i64), args.get("deslocamento").and_then(Value::as_i64))
+}
+
 fn id(args: &Value) -> AppResult<i64> {
     arg::<i64>(args, "id")
 }
@@ -188,11 +193,13 @@ pub fn executar(conn: &Connection, cmd: &str, args: &Value, ctx: &Contexto) -> A
     }
     match cmd {
         "clientes_listar" => ok(clientes::listar(conn)?),
+        "clientes_pagina" => ok(clientes::listar_pagina(conn, pagina_de(args))?),
         "clientes_criar" => ok(clientes::criar(conn, &arg(args, "dados")?)?),
         "clientes_atualizar" => ok(clientes::atualizar(conn, id(args)?, &arg(args, "dados")?)?),
         "clientes_remover" => { clientes::remover(conn, id(args)?)?; Ok(Value::Null) }
 
         "veiculos_listar" => ok(veiculos::listar(conn)?),
+        "veiculos_pagina" => ok(veiculos::listar_pagina(conn, pagina_de(args))?),
         "veiculos_criar" => ok(veiculos::criar(conn, &arg(args, "dados")?)?),
         "veiculos_atualizar" => ok(veiculos::atualizar(conn, id(args)?, &arg(args, "dados")?)?),
         "veiculos_remover" => { veiculos::remover(conn, id(args)?)?; Ok(Value::Null) }
@@ -215,12 +222,14 @@ pub fn executar(conn: &Connection, cmd: &str, args: &Value, ctx: &Contexto) -> A
         "funcionarios_revogar_acesso" => ok(funcionarios::revogar_acesso(conn, id(args)?)?),
 
         "itens_listar" => ok(itens::listar(conn)?),
+        "itens_pagina" => ok(itens::listar_pagina(conn, pagina_de(args))?),
         "itens_buscar_codigo" => ok(itens::buscar_por_codigo(conn, &arg::<String>(args, "codigo")?)?),
         "itens_criar" => ok(itens::criar(conn, &arg(args, "dados")?)?),
         "itens_atualizar" => ok(itens::atualizar(conn, id(args)?, &arg(args, "dados")?)?),
         "itens_remover" => { itens::remover(conn, id(args)?)?; Ok(Value::Null) }
 
         "ordens_listar" => ok(ordens::listar(conn)?),
+        "ordens_pagina" => ok(ordens::listar_pagina(conn, pagina_de(args))?),
         "ordens_buscar" => ok(ordens::buscar(conn, id(args)?)?),
         "ordens_criar" => ok(ordens::criar(conn, &arg(args, "dados")?)?),
         "ordens_substituir_itens" => {

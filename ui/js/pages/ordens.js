@@ -1,6 +1,7 @@
 // Ordens de serviço: criação com itens, mudança de status e exclusão.
 import { chamar, invocar } from '../api.js';
 import { el, aviso, botao, campo, icone, moeda, tabela, confirmar, cabecalhoPagina } from '../components.js';
+import { LOTE_LISTA } from '../crud.js';
 
 const ROTULOS_STATUS = {
   CRIADA: 'Criada',
@@ -136,30 +137,71 @@ export async function render(container, ctx = {}) {
     return linhas;
   }
 
+  // Lista de ordens em blocos (rolagem contínua): mais novas primeiro, sem trazer o histórico inteiro.
+  let ordensCarregadas = [];
+  let fimOrdens = false;
+  let carregandoOrdens = false;
+  let versaoOrdens = 0;
+  let observadorOrdens = null;
+
   async function carregarLista() {
+    versaoOrdens += 1;
+    ordensCarregadas = [];
+    fimOrdens = false;
+    carregandoOrdens = false;
+    await carregarBlocoOrdens();
+  }
+
+  async function carregarBlocoOrdens() {
+    if (carregandoOrdens || fimOrdens) return;
+    const versao = versaoOrdens;
+    carregandoOrdens = true;
     try {
-      const ordens = await chamar('ordens_listar');
-      const comAcoes = ordens.map((o) => ({
-        ...o,
-        // Venda de balcão não tem carro: mostra o tipo no lugar da placa.
-        veiculo_placa: o.tipo === 'BALCAO' ? 'Venda de balcão' : (o.veiculo_placa ?? ''),
-        cliente_nome: o.cliente_nome ?? (o.tipo === 'BALCAO' ? '—' : ''),
-        status_texto: el('span', { class: 'status' }, ROTULOS_STATUS[o.status] ?? o.status),
-        valor_fmt: moeda(o.valor_total),
-        __acoes: el('button', { class: 'link', onclick: () => mostrarDetalhe(o.id) }, 'abrir'),
-      }));
-      listaArea.replaceChildren(
-        el('h3', {}, 'Ordens'),
-        tabela([
-          { key: 'id', label: 'Nº' },
-          { key: 'veiculo_placa', label: 'Placa' },
-          { key: 'cliente_nome', label: 'Cliente' },
-          { key: 'status_texto', label: 'Status', render: (o) => o.status_texto },
-          { key: 'valor_fmt', label: 'Total', render: (o) => o.valor_fmt },
-        ], comAcoes, 'Nenhuma ordem de serviço.'),
-      );
+      const bloco = await chamar('ordens_pagina', { limite: LOTE_LISTA, deslocamento: ordensCarregadas.length });
+      if (versao !== versaoOrdens) return;
+      ordensCarregadas = ordensCarregadas.concat(bloco);
+      fimOrdens = bloco.length < LOTE_LISTA;
+      desenharOrdens();
     } catch (e) {
-      aviso(e.texto, 'erro');
+      if (versao === versaoOrdens) aviso(e.texto, 'erro');
+    } finally {
+      if (versao === versaoOrdens) carregandoOrdens = false;
+    }
+  }
+
+  function desenharOrdens() {
+    observadorOrdens?.disconnect();
+    observadorOrdens = null;
+    const comAcoes = ordensCarregadas.map((o) => ({
+      ...o,
+      // Venda de balcão não tem carro: mostra o tipo no lugar da placa.
+      veiculo_placa: o.tipo === 'BALCAO' ? 'Venda de balcão' : (o.veiculo_placa ?? ''),
+      cliente_nome: o.cliente_nome ?? (o.tipo === 'BALCAO' ? '—' : ''),
+      status_texto: el('span', { class: 'status' }, ROTULOS_STATUS[o.status] ?? o.status),
+      valor_fmt: moeda(o.valor_total),
+      __acoes: el('button', { class: 'link', onclick: () => mostrarDetalhe(o.id) }, 'abrir'),
+    }));
+    const rodape = !fimOrdens && ordensCarregadas.length
+      ? el('div', { class: 'carregar-mais' },
+          el('small', { class: 'ajuda' }, `${ordensCarregadas.length} carregadas. Role para ver mais.`),
+          botao({ texto: 'Carregar mais', icone: 'seta', onclick: () => carregarBlocoOrdens() }))
+      : (ordensCarregadas.length ? el('small', { class: 'ajuda carregar-mais' }, 'Fim da lista.') : null);
+    listaArea.replaceChildren(
+      el('h3', {}, 'Ordens'),
+      tabela([
+        { key: 'id', label: 'Nº' },
+        { key: 'veiculo_placa', label: 'Placa' },
+        { key: 'cliente_nome', label: 'Cliente' },
+        { key: 'status_texto', label: 'Status', render: (o) => o.status_texto },
+        { key: 'valor_fmt', label: 'Total', render: (o) => o.valor_fmt },
+      ], comAcoes, 'Nenhuma ordem de serviço.'),
+      rodape,
+    );
+    if (rodape && 'IntersectionObserver' in window) {
+      observadorOrdens = new IntersectionObserver((entradas) => {
+        if (entradas.some((e) => e.isIntersecting)) carregarBlocoOrdens();
+      }, { rootMargin: '240px' });
+      observadorOrdens.observe(rodape);
     }
   }
 

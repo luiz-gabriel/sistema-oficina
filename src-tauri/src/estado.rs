@@ -3,12 +3,14 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::ops::{Deref, DerefMut};
+use std::sync::{Mutex, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
 use oficina_core::comandos::Contexto;
 use oficina_core::error::{AppError, AppResult};
-use oficina_core::{ativacao, config};
+use oficina_core::db::{ConexaoPiscina, Piscina};
+use oficina_core::{ativacao, config, db};
 use rusqlite::Connection;
 
 use crate::rede::Identidade;
@@ -27,8 +29,29 @@ pub struct Rede {
     pub ultima_busca: Mutex<Option<Instant>>,
 }
 
+/// Conexão emprestada do banco. Enquanto existir, o banco não pode ser trocado (restauração espera).
+pub struct Conexao<'a> {
+    // Ordem importa: a conexão volta à piscina antes de soltar a trava.
+    conn: ConexaoPiscina,
+    _trava: RwLockReadGuard<'a, Option<Piscina>>,
+}
+
+impl Deref for Conexao<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl DerefMut for Conexao<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+}
+
 pub struct Estado {
-    pub conn: Arc<Mutex<Connection>>,
+    /// Piscina de conexões ao banco. `None` só durante a restauração de um backup.
+    pub piscina: RwLock<Option<Piscina>>,
     pub sessao: Mutex<Option<Contexto>>,
     pub rede: Rede,
     pub dir: PathBuf,
@@ -39,14 +62,22 @@ pub struct Estado {
 }
 
 impl Estado {
-    pub fn novo(conn: Connection, dir: PathBuf, porta: u16) -> Estado {
+    /// Abre o banco da instalação (cria o esquema se preciso) e a piscina de conexões.
+    pub fn novo(dir: PathBuf, porta: u16) -> AppResult<Estado> {
+        let caminho = dir.join("oficina.db");
+        db::open(&caminho)?;
+        let piscina = db::piscina(&caminho)?;
+        Ok(Estado::com_piscina(piscina, dir, porta))
+    }
+
+    fn com_piscina(piscina: Piscina, dir: PathBuf, porta: u16) -> Estado {
         let computador = std::fs::read_to_string("/etc/hostname")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "Computador".into());
         Estado {
-            conn: Arc::new(Mutex::new(conn)),
+            piscina: RwLock::new(Some(piscina)),
             sessao: Mutex::new(None),
             rede: Rede {
                 conectado: AtomicBool::new(false),
@@ -64,8 +95,14 @@ impl Estado {
         }
     }
 
-    pub fn db(&self) -> AppResult<MutexGuard<'_, Connection>> {
-        self.conn.lock().map_err(|_| AppError::Database("conexão indisponível".into()))
+    /// Pega uma conexão da piscina. Várias requisições leem ao mesmo tempo; a escrita espera o bloqueio do SQLite.
+    pub fn db(&self) -> AppResult<Conexao<'_>> {
+        let trava = self.piscina.read().map_err(|_| AppError::Database("conexão indisponível".into()))?;
+        let conn = match trava.as_ref() {
+            Some(p) => p.get().map_err(|e| AppError::Database(format!("sem conexão disponível com o banco: {e}")))?,
+            None => return Err(AppError::Database("o banco está sendo trocado, tente de novo.".into())),
+        };
+        Ok(Conexao { conn, _trava: trava })
     }
 
     pub fn get(&self, chave: &str, padrao: &str) -> AppResult<String> {

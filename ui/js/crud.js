@@ -15,7 +15,11 @@ export function coerceDados(campos, bruto) {
 import { chamar } from './api.js';
 import { el, aviso, campo, tabela, confirmar, botao, icone, cabecalhoPagina } from './components.js';
 
-// config = { titulo, icone, descricao, comando, colunas, campos, vazio, topo?(elemento, api), extraEdicao?(registro),
+// Tamanho de cada bloco da lista. Listas com `paginada: true` carregam o próximo bloco quando a pessoa
+// chega perto do fim da tabela (rolagem contínua), em vez de trazer o cadastro inteiro de uma vez.
+export const LOTE_LISTA = 80;
+
+// config = { titulo, icone, descricao, comando, colunas, campos, vazio, paginada?, topo?(elemento, api), extraEdicao?(registro),
 //            acoesLinha?(registro, ctx) => nó[] }
 // Campos podem usar `options` como função assíncrona para listas de outros cadastros.
 // Ao abrir a página, `ctx.opcoes.valores` (se houver) preenche o formulário de cadastro novo
@@ -61,20 +65,71 @@ export function crudPage(config) {
     // Atalho de cadastro (ex.: Ctrl+F4 em Peças): abre direto o formulário de cadastro novo.
     if (ctx.opcoes?.novo) api.novo();
 
+    // Estado da lista: registros já carregados, se acabou, e uma "versão" para descartar respostas atrasadas
+    // (se a lista for recarregada enquanto um bloco ainda vem, o bloco antigo não entra na lista nova).
+    let carregados = [];
+    let fimDaLista = false;
+    let carregandoBloco = false;
+    let versaoLista = 0;
+    let observadorFim = null;
+
     async function carregarLista() {
+      versaoLista += 1;
+      carregados = [];
+      fimDaLista = false;
+      carregandoBloco = false;
+      await carregarBloco();
+    }
+
+    async function carregarBloco() {
+      if (carregandoBloco || fimDaLista) return;
+      const versao = versaoLista;
+      carregandoBloco = true;
       try {
-        const linhas = await chamar(`${config.comando}_listar`);
-        const linhasComAcoes = linhas.map((linha) => ({
-          ...linha,
-          __acoes: el('span', { class: 'botoes-linha' },
-            botao({ texto: 'Editar', icone: 'lapis', tipo: 'link', onclick: () => { editando = linha; erros = {}; desenharForm(); formArea.scrollIntoView({ behavior: 'smooth' }); } }),
-            botao({ texto: 'Excluir', icone: 'lixeira', tipo: 'link perigo', onclick: () => remover(linha) }),
-            ...(config.acoesLinha?.(linha, ctx) ?? []),
-          ),
-        }));
-        listaArea.replaceChildren(el('h3', {}, 'Cadastrados'), tabela(config.colunas, linhasComAcoes, config.vazio));
+        const bloco = config.paginada
+          ? await chamar(`${config.comando}_pagina`, { limite: LOTE_LISTA, deslocamento: carregados.length })
+          : await chamar(`${config.comando}_listar`);
+        if (versao !== versaoLista) return;
+        carregados = carregados.concat(bloco);
+        fimDaLista = !config.paginada || bloco.length < LOTE_LISTA;
+        desenharLista();
       } catch (e) {
-        aviso(e.texto, 'erro');
+        if (versao === versaoLista) aviso(e.texto, 'erro');
+      } finally {
+        if (versao === versaoLista) carregandoBloco = false;
+      }
+    }
+
+    function linhaComAcoes(linha) {
+      return {
+        ...linha,
+        __acoes: el('span', { class: 'botoes-linha' },
+          botao({ texto: 'Editar', icone: 'lapis', tipo: 'link', onclick: () => { editando = linha; erros = {}; desenharForm(); formArea.scrollIntoView({ behavior: 'smooth' }); } }),
+          botao({ texto: 'Excluir', icone: 'lixeira', tipo: 'link perigo', onclick: () => remover(linha) }),
+          ...(config.acoesLinha?.(linha, ctx) ?? []),
+        ),
+      };
+    }
+
+    // Desenha os blocos carregados. Sem paginação, a lista já é completa e não há o que buscar.
+    function desenharLista() {
+      observadorFim?.disconnect();
+      observadorFim = null;
+      const rodape = config.paginada && !fimDaLista && carregados.length
+        ? el('div', { class: 'carregar-mais' },
+            el('small', { class: 'ajuda' }, `${carregados.length} carregados. Role para ver mais.`),
+            botao({ texto: 'Carregar mais', icone: 'seta', onclick: () => carregarBloco() }))
+        : (config.paginada && carregados.length ? el('small', { class: 'ajuda carregar-mais' }, 'Fim da lista.') : null);
+      listaArea.replaceChildren(
+        el('h3', {}, 'Cadastrados'),
+        tabela(config.colunas, carregados.map(linhaComAcoes), config.vazio),
+        rodape,
+      );
+      if (rodape && 'IntersectionObserver' in window) {
+        observadorFim = new IntersectionObserver((entradas) => {
+          if (entradas.some((e) => e.isIntersecting)) carregarBloco();
+        }, { rootMargin: '240px' });
+        observadorFim.observe(rodape);
       }
     }
 
