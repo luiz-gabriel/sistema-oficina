@@ -4,16 +4,22 @@
 //! Escuta na interface da rede local (0.0.0.0). Sem HTTPS nesta fase: o cookie não recebe `Secure`.
 pub mod porta;
 mod rotas;
+mod tls;
 
 use std::collections::HashMap;
-use std::io::Read;
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use axum::body::{to_bytes, Body};
+use axum::extract::State;
+use axum::http::{header, HeaderName, HeaderValue, Request as AxRequest, StatusCode};
+use axum::response::Response;
+use axum::Router;
+use axum_server::tls_rustls::RustlsConfig;
+use axum_server::Handle;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -34,7 +40,8 @@ pub struct Web {
 
 struct Ativo {
     endereco: Endereco,
-    rodando: Arc<AtomicBool>,
+    http: Handle,
+    https: Handle,
 }
 
 /// Endereço efetivo que o painel e o QR Code devem mostrar.
@@ -47,6 +54,9 @@ pub struct Endereco {
     /// Porta salva da execução anterior, se ela mudou agora (links antigos podem deixar de funcionar).
     pub porta_anterior: Option<u16>,
     pub aviso: Option<String>,
+    /// Endereço HTTPS (certificado autoassinado da instalação; o navegador mostra aviso).
+    pub url_https: Option<String>,
+    pub porta_https: Option<u16>,
 }
 
 /// Pedido já lido. Só o necessário para as rotas.
@@ -137,6 +147,18 @@ fn subir(est: &Arc<Estado>, ui: PathBuf) -> Result<Endereco, String> {
         Some(ip) => format!("http://{ip}:{porta_final}/"),
         None => format!("http://127.0.0.1:{porta_final}/"),
     };
+    // HTTPS em porta livre própria; a chave da instalação é reaproveitada nas próximas inicializações.
+    let listener_https = porta::ligar_lan(0).map_err(|e| format!("Não consegui abrir a porta HTTPS: {e}"))?;
+    let porta_https = listener_https.local_addr().map_err(|e| e.to_string())?.port();
+    let mut nomes = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    if let Some(i) = ip {
+        nomes.push(i.to_string());
+    }
+    let identidade = tls::identidade(&est.dir, nomes)?;
+    let url_https = match ip {
+        Some(ip) => format!("https://{ip}:{porta_https}/"),
+        None => format!("https://127.0.0.1:{porta_https}/"),
+    };
     let porta_anterior = salva.filter(|p| *p != porta_final);
     let mut avisos = Vec::new();
     if let Some(anterior) = porta_anterior {
@@ -152,12 +174,12 @@ fn subir(est: &Arc<Estado>, ui: PathBuf) -> Result<Endereco, String> {
         origem: escolhida.origem.nome(),
         porta_anterior,
         aviso: if avisos.is_empty() { None } else { Some(avisos.join(" ")) },
+        url_https: Some(url_https),
+        porta_https: Some(porta_https),
     };
-    let rodando = Arc::new(AtomicBool::new(true));
-    let vigia = rodando.clone();
-    let (est2, ui2, listener) = (est.clone(), ui, escolhida.listener);
-    thread::spawn(move || servir(listener, est2, ui2, vigia));
-    *est.web.ativo.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ativo { endereco: endereco.clone(), rodando });
+    let http = iniciar_http(escolhida.listener, est.clone(), ui.clone());
+    let https = iniciar_https(listener_https, est.clone(), ui, identidade);
+    *est.web.ativo.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ativo { endereco: endereco.clone(), http, https });
     Ok(endereco)
 }
 
@@ -165,91 +187,109 @@ fn subir(est: &Arc<Estado>, ui: PathBuf) -> Result<Endereco, String> {
 pub fn parar(est: &Estado) {
     let ativo = est.web.ativo.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(a) = ativo {
-        a.rodando.store(false, Ordering::SeqCst);
-        // Acorda a thread que espera conexões; ela confere a flag e sai.
-        let _ = TcpStream::connect_timeout(
-            &std::net::SocketAddr::from(([127, 0, 0, 1], a.endereco.porta)),
-            Duration::from_millis(300),
-        );
+        a.http.graceful_shutdown(Some(Duration::from_secs(1)));
+        a.https.graceful_shutdown(Some(Duration::from_secs(1)));
     }
     est.web.definir_erro(None);
 }
 
-fn servir(listener: TcpListener, est: Arc<Estado>, ui: PathBuf, rodando: Arc<AtomicBool>) {
-    let servidor = match tiny_http::Server::from_listener(listener, None) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("erro ao iniciar o servidor web: {e}");
-            return;
+/// Estado compartilhado pelas rotas axum.
+#[derive(Clone)]
+struct Ctx {
+    est: Arc<Estado>,
+    ui: Arc<PathBuf>,
+}
+
+fn roteador(ctx: Ctx) -> Router {
+    Router::new().fallback(atender).with_state(ctx)
+}
+
+/// Sobe o servidor HTTP numa thread com runtime próprio. Devolve o controle de desligamento.
+pub fn iniciar_http(listener: TcpListener, est: Arc<Estado>, ui: PathBuf) -> Handle {
+    let handle = Handle::new();
+    let h = handle.clone();
+    let ctx = Ctx { est, ui: Arc::new(ui) };
+    thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => return eprintln!("erro ao iniciar o runtime do servidor web: {e}"),
+        };
+        rt.block_on(async move {
+            if let Err(e) = axum_server::from_tcp(listener).handle(h).serve(roteador(ctx).into_make_service()).await {
+                eprintln!("erro no servidor web: {e}");
+            }
+        });
+    });
+    handle
+}
+
+/// Sobe o servidor HTTPS com rustls, usando a identidade da instalação.
+fn iniciar_https(listener: TcpListener, est: Arc<Estado>, ui: PathBuf, id: tls::Identidade) -> Handle {
+    let handle = Handle::new();
+    let h = handle.clone();
+    let ctx = Ctx { est, ui: Arc::new(ui) };
+    thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => return eprintln!("erro ao iniciar o runtime do HTTPS: {e}"),
+        };
+        rt.block_on(async move {
+            let config = match RustlsConfig::from_pem(id.cert_pem, id.chave_pem).await {
+                Ok(c) => c,
+                Err(e) => return eprintln!("erro ao carregar o certificado HTTPS: {e}"),
+            };
+            if let Err(e) = axum_server::from_tcp_rustls(listener, config)
+                .handle(h)
+                .serve(roteador(ctx).into_make_service())
+                .await
+            {
+                eprintln!("erro no servidor HTTPS: {e}");
+            }
+        });
+    });
+    handle
+}
+
+/// Converte o pedido axum em `Requisicao`, trata e devolve a resposta.
+async fn atender(State(ctx): State<Ctx>, pedido: AxRequest<Body>) -> Response {
+    let (partes, corpo) = pedido.into_parts();
+    let resposta = match to_bytes(corpo, LIMITE_CORPO).await {
+        Err(_) => Resposta::erro(413, "tamanho", "Pedido grande demais."),
+        Ok(bytes) => {
+            let req = Requisicao {
+                metodo: partes.method.as_str().to_string(),
+                caminho: partes.uri.path().to_string(),
+                cookie: partes
+                    .headers
+                    .get(header::COOKIE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string),
+                corpo: bytes.to_vec(),
+            };
+            tokio::task::spawn_blocking(move || tratar(&ctx.est, &ctx.ui, &req))
+                .await
+                .unwrap_or_else(|_| Resposta::erro(500, "interno", "Erro interno."))
         }
     };
-    for pedido in servidor.incoming_requests() {
-        if !rodando.load(Ordering::SeqCst) {
-            break;
-        }
-        let (est, ui) = (est.clone(), ui.clone());
-        thread::spawn(move || atender(pedido, &est, &ui));
-    }
+    para_axum(&resposta)
 }
 
-/// Atende uma requisição: converte para `Requisicao`, trata e responde.
-pub fn atender(pedido: tiny_http::Request, est: &Estado, ui: &Path) {
-    let mut pedido = pedido;
-    let resposta = match ler_requisicao(&mut pedido) {
-        Ok(req) => tratar(est, ui, &req),
-        Err(r) => r,
-    };
-    let _ = pedido.respond(para_tiny(&resposta));
-}
-
-/// Lê método, caminho, cookie e corpo com limites. Erros viram resposta 400/413 pronta.
-pub fn ler_requisicao(pedido: &mut tiny_http::Request) -> Result<Requisicao, Resposta> {
-    let ruim = || Resposta::erro(400, "requisicao", "Requisição inválida.");
-    if pedido.body_length().unwrap_or(0) > LIMITE_CORPO {
-        return Err(Resposta::erro(413, "tamanho", "Pedido grande demais."));
-    }
-    let mut corpo = Vec::new();
-    pedido
-        .as_reader()
-        .take(LIMITE_CORPO as u64 + 1)
-        .read_to_end(&mut corpo)
-        .map_err(|_| ruim())?;
-    if corpo.len() > LIMITE_CORPO {
-        return Err(Resposta::erro(413, "tamanho", "Pedido grande demais."));
-    }
-    let url = pedido.url().to_string();
-    let caminho = url.split('?').next().unwrap_or("/").to_string();
-    let cookie = pedido
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Cookie"))
-        .map(|h| h.value.as_str().to_string());
-    Ok(Requisicao {
-        metodo: pedido.method().as_str().to_string(),
-        caminho,
-        cookie,
-        corpo,
-    })
-}
-
-/// Converte a resposta interna para a da biblioteca, com cabeçalhos de segurança.
-fn para_tiny(r: &Resposta) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
-    let mut resp = tiny_http::Response::from_data(r.corpo.clone())
-        .with_status_code(r.status)
-        .with_header(header("Content-Type", &r.tipo))
-        .with_header(header("X-Content-Type-Options", "nosniff"))
-        .with_header(header("X-Frame-Options", "DENY"))
-        .with_header(header("Referrer-Policy", "no-referrer"))
-        .with_header(header("Cache-Control", "no-store"))
-        .with_header(header("Connection", "close"));
+/// Monta a resposta axum com cabeçalhos de segurança.
+fn para_axum(r: &Resposta) -> Response {
+    let status = StatusCode::from_u16(r.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut b = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, r.tipo.as_str())
+        .header("X-Content-Type-Options", "nosniff")
+        .header("X-Frame-Options", "DENY")
+        .header("Referrer-Policy", "no-referrer")
+        .header(header::CACHE_CONTROL, "no-store");
     for (k, v) in &r.cabecalhos {
-        resp = resp.with_header(header(k, v));
+        if let (Ok(nome), Ok(valor)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
+            b = b.header(nome, valor);
+        }
     }
-    resp
-}
-
-fn header(nome: &str, valor: &str) -> tiny_http::Header {
-    tiny_http::Header::from_bytes(nome.as_bytes(), valor.as_bytes()).expect("cabeçalho válido")
+    b.body(Body::from(r.corpo.clone())).unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
 pub fn tratar(est: &Estado, ui: &Path, req: &Requisicao) -> Resposta {

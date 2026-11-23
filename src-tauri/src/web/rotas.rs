@@ -247,20 +247,15 @@ mod testes {
     fn pedir(est: &Arc<Estado>, pedido: &str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let porta = listener.local_addr().unwrap().port();
-        let est2 = est.clone();
         let ui = std::env::temp_dir().join("oficina_ui_inexistente_teste");
-        std::thread::spawn(move || {
-            let servidor = tiny_http::Server::from_listener(listener, None).unwrap();
-            if let Ok(pedido) = servidor.recv() {
-                super::super::atender(pedido, &est2, &ui);
-            }
-        });
-        let mut s = TcpStream::connect(("127.0.0.1", porta)).unwrap();
+        let servidor = super::super::iniciar_http(listener, est.clone(), ui);
         // Pede o fechamento da conexão, para o cliente de teste ler até o fim da resposta.
         let pedido = pedido.replacen("\r\n", "\r\nConnection: close\r\n", 1);
+        let mut s = TcpStream::connect(("127.0.0.1", porta)).unwrap();
         s.write_all(pedido.as_bytes()).unwrap();
         let mut resp = String::new();
         s.read_to_string(&mut resp).unwrap();
+        servidor.shutdown();
         resp
     }
 
@@ -283,8 +278,13 @@ mod testes {
     }
 
     fn token_do_cookie(resp: &str) -> String {
-        let linha = resp.lines().find(|l| l.starts_with("Set-Cookie:")).expect("cookie de sessão");
-        linha.trim_start_matches("Set-Cookie: ").split(';').next().unwrap().to_string()
+        // Nomes de cabeçalho não diferenciam maiúsculas; o hyper os envia em minúsculas.
+        let linha = resp
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+            .expect("cookie de sessão");
+        let valor = linha.split_once(':').unwrap().1.trim();
+        valor.split(';').next().unwrap().to_string()
     }
 
     #[test]
@@ -337,6 +337,33 @@ mod testes {
         let cookie = token_do_cookie(&pedir(&est, &login_pedido("segredo123")));
         est.db().unwrap().execute("UPDATE funcionarios SET senha_hash = NULL", []).unwrap();
         assert_eq!(status(&pedir(&est, &get("/api/clientes", Some(&cookie)))), 401);
+    }
+
+    #[test]
+    fn https_responde_com_a_identidade_da_instalacao() {
+        let est = estado_de_teste();
+        let id = super::super::tls::identidade(&est.dir, vec!["localhost".into()]).unwrap();
+        let cert = reqwest::Certificate::from_pem(&id.cert_pem).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let porta = listener.local_addr().unwrap().port();
+        let ui = std::env::temp_dir().join("oficina_ui_inexistente_teste");
+        let servidor = super::super::iniciar_https(listener, est.clone(), ui, id);
+        let cliente = reqwest::blocking::Client::builder()
+            .add_root_certificate(cert)
+            .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], porta)))
+            .build()
+            .unwrap();
+        let resp = cliente.get(format!("https://localhost:{porta}/api/estado")).send().unwrap();
+        assert_eq!(resp.status(), 200);
+        // Certificado que não é o da instalação deve ser recusado pelo cliente.
+        let outro = reqwest::Certificate::from_pem(&super::super::tls::identidade(&std::env::temp_dir().join(format!("oficina_outra_{}", std::process::id())), vec!["localhost".into()]).unwrap().cert_pem).unwrap();
+        let cliente_outro = reqwest::blocking::Client::builder()
+            .tls_certs_only(vec![outro])
+            .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], porta)))
+            .build()
+            .unwrap();
+        assert!(cliente_outro.get(format!("https://localhost:{porta}/api/estado")).send().is_err());
+        servidor.shutdown();
     }
 
     #[test]
