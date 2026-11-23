@@ -64,6 +64,7 @@ pub fn tratar(est: &Estado, req: &Requisicao) -> Resposta {
     let metodo = req.metodo.as_str();
     match (metodo, caminho) {
         ("GET", "/api/estado") => return estado(est, req),
+        ("GET", "/api/ca.crt") => return ca_local(est),
         ("POST", "/api/login") => return login(est, req),
         ("POST", "/api/logout") => return logout(est, req),
         (_, "/api/estado") | (_, "/api/login") | (_, "/api/logout") => return metodo_errado(),
@@ -147,6 +148,20 @@ fn leitura(est: &Estado, req: &Requisicao, rota: &Leitura, id: i64) -> Resposta 
     match resultado {
         Ok(valor) => Resposta::json(200, &valor),
         Err(r) => r,
+    }
+}
+
+/// Certificado público da CA local, para o celular instalar e confiar no HTTPS da instalação.
+/// Não tem chave privada e não exige login: o aparelho precisa dele antes de conseguir entrar.
+fn ca_local(est: &Estado) -> Resposta {
+    match super::tls::ca_pem(&est.dir) {
+        Some(pem) => Resposta {
+            status: 200,
+            tipo: "application/x-x509-ca-cert".into(),
+            cabecalhos: vec![("Content-Disposition".into(), "attachment; filename=\"oficina-ca.crt\"".into())],
+            corpo: pem,
+        },
+        None => Resposta::erro(404, "not_found", "A CA local ainda não foi criada."),
     }
 }
 
@@ -493,20 +508,25 @@ mod testes {
     fn https_responde_com_a_identidade_da_instalacao() {
         let est = estado_de_teste();
         let id = super::super::tls::identidade(&est.dir, vec!["localhost".into()]).unwrap();
-        let cert = reqwest::Certificate::from_pem(&id.cert_pem).unwrap();
+        // O cliente confia só na CA local (sem certificados embutidos): a validação é real.
+        let cert = reqwest::Certificate::from_pem(&super::super::tls::ca_pem(&est.dir).unwrap()).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let porta = listener.local_addr().unwrap().port();
         let ui = std::env::temp_dir().join("oficina_ui_inexistente_teste");
         let servidor = super::super::iniciar_https(listener, est.clone(), ui, id);
         let cliente = reqwest::blocking::Client::builder()
-            .add_root_certificate(cert)
+            .tls_certs_only(vec![cert])
             .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], porta)))
             .build()
             .unwrap();
         let resp = cliente.get(format!("https://localhost:{porta}/api/estado")).send().unwrap();
         assert_eq!(resp.status(), 200);
-        // Certificado que não é o da instalação deve ser recusado pelo cliente.
-        let outro = reqwest::Certificate::from_pem(&super::super::tls::identidade(&std::env::temp_dir().join(format!("oficina_outra_{}", std::process::id())), vec!["localhost".into()]).unwrap().cert_pem).unwrap();
+        // CA de outra instalação deve ser recusada pelo cliente.
+        let outro_dir = std::env::temp_dir().join(format!("oficina_outra_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outro_dir);
+        super::super::tls::identidade(&outro_dir, vec!["localhost".into()]).unwrap();
+        let outro = reqwest::Certificate::from_pem(&super::super::tls::ca_pem(&outro_dir).unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&outro_dir);
         let cliente_outro = reqwest::blocking::Client::builder()
             .tls_certs_only(vec![outro])
             .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], porta)))
@@ -514,6 +534,16 @@ mod testes {
             .unwrap();
         assert!(cliente_outro.get(format!("https://localhost:{porta}/api/estado")).send().is_err());
         servidor.shutdown();
+    }
+
+    #[test]
+    fn ca_local_so_fica_disponivel_depois_de_criada() {
+        let est = estado_de_teste();
+        assert_eq!(status(&pedir(&est, &get("/api/ca.crt", None))), 404);
+        super::super::tls::identidade(&est.dir, vec!["localhost".into()]).unwrap();
+        let r = pedir(&est, &get("/api/ca.crt", None));
+        assert_eq!(status(&r), 200);
+        assert!(r.contains(String::from_utf8_lossy(&super::super::tls::ca_pem(&est.dir).unwrap()).trim()), "o download deve ser exatamente a CA da instalação");
     }
 
     #[test]
