@@ -250,11 +250,14 @@ mod testes {
         let est2 = est.clone();
         let ui = std::env::temp_dir().join("oficina_ui_inexistente_teste");
         std::thread::spawn(move || {
-            for s in listener.incoming().take(1).flatten() {
-                super::super::atender(s, &est2, &ui);
+            let servidor = tiny_http::Server::from_listener(listener, None).unwrap();
+            if let Ok(pedido) = servidor.recv() {
+                super::super::atender(pedido, &est2, &ui);
             }
         });
         let mut s = TcpStream::connect(("127.0.0.1", porta)).unwrap();
+        // Pede o fechamento da conexão, para o cliente de teste ler até o fim da resposta.
+        let pedido = pedido.replacen("\r\n", "\r\nConnection: close\r\n", 1);
         s.write_all(pedido.as_bytes()).unwrap();
         let mut resp = String::new();
         s.read_to_string(&mut resp).unwrap();

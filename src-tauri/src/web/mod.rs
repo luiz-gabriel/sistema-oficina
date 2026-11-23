@@ -1,12 +1,12 @@
 //! Servidor web local: serve a interface (`ui/`) para navegadores da rede local e expõe rotas HTTP
 //! explícitas (ver `rotas.rs`). Não usa a rede entre computadores (`rede.rs`): é outra porta e outro protocolo.
-//! HTTP/1.1 mínimo com a biblioteca padrão: uma conexão por requisição (`Connection: close`).
+//! Transporte HTTP feito pela biblioteca `tiny_http` (HTTP/1.1, uma requisição por conexão).
 //! Escuta na interface da rede local (0.0.0.0). Sem HTTPS nesta fase: o cookie não recebe `Secure`.
 pub mod porta;
 mod rotas;
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::Read;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,9 +21,7 @@ use crate::estado::Estado;
 
 /// Nome do cookie de sessão do navegador.
 pub const NOME_COOKIE: &str = "oficina_sessao";
-const LIMITE_CABECALHO: usize = 16 * 1024;
 const LIMITE_CORPO: usize = 64 * 1024;
-const TEMPO_LEITURA: Duration = Duration::from_secs(5);
 
 /// Estado do servidor web guardado em `Estado`.
 #[derive(Default)]
@@ -178,81 +176,82 @@ pub fn parar(est: &Estado) {
 }
 
 fn servir(listener: TcpListener, est: Arc<Estado>, ui: PathBuf, rodando: Arc<AtomicBool>) {
-    for conexao in listener.incoming() {
+    let servidor = match tiny_http::Server::from_listener(listener, None) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("erro ao iniciar o servidor web: {e}");
+            return;
+        }
+    };
+    for pedido in servidor.incoming_requests() {
         if !rodando.load(Ordering::SeqCst) {
             break;
         }
-        if let Ok(s) = conexao {
-            let (est, ui) = (est.clone(), ui.clone());
-            thread::spawn(move || atender(s, &est, &ui));
-        }
+        let (est, ui) = (est.clone(), ui.clone());
+        thread::spawn(move || atender(pedido, &est, &ui));
     }
 }
 
-/// Atende uma conexão: lê o pedido, trata e responde. Uma conexão por requisição.
-pub fn atender(mut s: TcpStream, est: &Estado, ui: &Path) {
-    let _ = s.set_read_timeout(Some(TEMPO_LEITURA));
-    let resposta = match ler_requisicao(&mut s) {
+/// Atende uma requisição: converte para `Requisicao`, trata e responde.
+pub fn atender(pedido: tiny_http::Request, est: &Estado, ui: &Path) {
+    let mut pedido = pedido;
+    let resposta = match ler_requisicao(&mut pedido) {
         Ok(req) => tratar(est, ui, &req),
         Err(r) => r,
     };
-    let _ = escrever(&mut s, &resposta);
+    let _ = pedido.respond(para_tiny(&resposta));
 }
 
-/// Lê cabeçalhos e corpo. Qualquer erro de formato vira resposta 400/413 pronta.
-pub fn ler_requisicao<R: Read>(s: &mut R) -> Result<Requisicao, Resposta> {
+/// Lê método, caminho, cookie e corpo com limites. Erros viram resposta 400/413 pronta.
+pub fn ler_requisicao(pedido: &mut tiny_http::Request) -> Result<Requisicao, Resposta> {
     let ruim = || Resposta::erro(400, "requisicao", "Requisição inválida.");
-    let mut buf: Vec<u8> = Vec::new();
-    let fim_cabecalho = loop {
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos;
-        }
-        if buf.len() > LIMITE_CABECALHO {
-            return Err(Resposta::erro(431, "requisicao", "Cabeçalho grande demais."));
-        }
-        let mut parte = [0u8; 1024];
-        let n = s.read(&mut parte).map_err(|_| ruim())?;
-        if n == 0 {
-            return Err(ruim());
-        }
-        buf.extend_from_slice(&parte[..n]);
-    };
-    let cabecalho = std::str::from_utf8(&buf[..fim_cabecalho]).map_err(|_| ruim())?;
-    let mut linhas = cabecalho.split("\r\n");
-    let mut primeira = linhas.next().ok_or_else(ruim)?.split_whitespace();
-    let (metodo, alvo) = match (primeira.next(), primeira.next(), primeira.next()) {
-        (Some(m), Some(a), Some(v)) if v.starts_with("HTTP/") => (m.to_string(), a.to_string()),
-        _ => return Err(ruim()),
-    };
-    let caminho = alvo.split('?').next().unwrap_or("").to_string();
-    let mut cookie = None;
-    let mut tamanho: usize = 0;
-    for linha in linhas {
-        if let Some((k, v)) = linha.split_once(':') {
-            match k.trim().to_ascii_lowercase().as_str() {
-                "cookie" => cookie = Some(v.trim().to_string()),
-                "content-length" => tamanho = v.trim().parse().map_err(|_| ruim())?,
-                _ => {}
-            }
-        }
+    if pedido.body_length().unwrap_or(0) > LIMITE_CORPO {
+        return Err(Resposta::erro(413, "tamanho", "Pedido grande demais."));
     }
-    if tamanho > LIMITE_CORPO {
-        return Err(Resposta::erro(413, "requisicao", "Pedido grande demais."));
+    let mut corpo = Vec::new();
+    pedido
+        .as_reader()
+        .take(LIMITE_CORPO as u64 + 1)
+        .read_to_end(&mut corpo)
+        .map_err(|_| ruim())?;
+    if corpo.len() > LIMITE_CORPO {
+        return Err(Resposta::erro(413, "tamanho", "Pedido grande demais."));
     }
-    let mut corpo = buf[fim_cabecalho + 4..].to_vec();
-    while corpo.len() < tamanho {
-        let mut parte = [0u8; 1024];
-        let n = s.read(&mut parte).map_err(|_| ruim())?;
-        if n == 0 {
-            return Err(ruim());
-        }
-        corpo.extend_from_slice(&parte[..n]);
-    }
-    corpo.truncate(tamanho);
-    Ok(Requisicao { metodo, caminho, cookie, corpo })
+    let url = pedido.url().to_string();
+    let caminho = url.split('?').next().unwrap_or("/").to_string();
+    let cookie = pedido
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Cookie"))
+        .map(|h| h.value.as_str().to_string());
+    Ok(Requisicao {
+        metodo: pedido.method().as_str().to_string(),
+        caminho,
+        cookie,
+        corpo,
+    })
 }
 
-/// Ponto de entrada das requisições: API (`/api/...`) ou arquivos da interface.
+/// Converte a resposta interna para a da biblioteca, com cabeçalhos de segurança.
+fn para_tiny(r: &Resposta) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    let mut resp = tiny_http::Response::from_data(r.corpo.clone())
+        .with_status_code(r.status)
+        .with_header(header("Content-Type", &r.tipo))
+        .with_header(header("X-Content-Type-Options", "nosniff"))
+        .with_header(header("X-Frame-Options", "DENY"))
+        .with_header(header("Referrer-Policy", "no-referrer"))
+        .with_header(header("Cache-Control", "no-store"))
+        .with_header(header("Connection", "close"));
+    for (k, v) in &r.cabecalhos {
+        resp = resp.with_header(header(k, v));
+    }
+    resp
+}
+
+fn header(nome: &str, valor: &str) -> tiny_http::Header {
+    tiny_http::Header::from_bytes(nome.as_bytes(), valor.as_bytes()).expect("cabeçalho válido")
+}
+
 pub fn tratar(est: &Estado, ui: &Path, req: &Requisicao) -> Resposta {
     if req.caminho == "/api" || req.caminho.starts_with("/api/") {
         return rotas::tratar(est, req);
@@ -304,39 +303,6 @@ fn tipo_de(p: &Path) -> String {
     t.into()
 }
 
-fn escrever<W: Write>(s: &mut W, r: &Resposta) -> io::Result<()> {
-    let motivo = match r.status {
-        200 => "OK",
-        204 => "No Content",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        409 => "Conflict",
-        413 => "Payload Too Large",
-        422 => "Unprocessable Entity",
-        423 => "Locked",
-        429 => "Too Many Requests",
-        431 => "Request Header Fields Too Large",
-        _ => "Internal Server Error",
-    };
-    let mut cab = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\
-         X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\n",
-        r.status,
-        motivo,
-        r.tipo,
-        r.corpo.len()
-    );
-    for (k, v) in &r.cabecalhos {
-        cab.push_str(&format!("{k}: {v}\r\n"));
-    }
-    cab.push_str("\r\n");
-    s.write_all(cab.as_bytes())?;
-    s.write_all(&r.corpo)?;
-    s.flush()
-}
-
 /// Caminho da pasta `ui/` quando o projeto está no disco (desenvolvimento).
 pub fn pasta_ui() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("ui")
@@ -345,30 +311,6 @@ pub fn pasta_ui() -> PathBuf {
 #[cfg(test)]
 mod testes {
     use super::*;
-    use std::io::Cursor;
-
-    #[test]
-    fn le_metodo_caminho_cookie_e_corpo() {
-        let pedido = b"POST /api/login?x=1 HTTP/1.1\r\nHost: a\r\nCookie: oficina_sessao=abc\r\nContent-Length: 5\r\n\r\nhello";
-        let r = ler_requisicao(&mut Cursor::new(&pedido[..])).expect("pedido válido");
-        assert_eq!(r.metodo, "POST");
-        assert_eq!(r.caminho, "/api/login");
-        assert_eq!(r.cookie.as_deref(), Some("oficina_sessao=abc"));
-        assert_eq!(r.corpo, b"hello");
-    }
-
-    #[test]
-    fn recusa_linha_de_requisicao_invalida() {
-        let r = ler_requisicao(&mut Cursor::new(&b"LIXO\r\n\r\n"[..]));
-        assert_eq!(r.err().map(|r| r.status), Some(400));
-    }
-
-    #[test]
-    fn recusa_corpo_grande_demais() {
-        let pedido = format!("POST /api/login HTTP/1.1\r\nContent-Length: {}\r\n\r\n", LIMITE_CORPO + 1);
-        let r = ler_requisicao(&mut Cursor::new(pedido.as_bytes()));
-        assert_eq!(r.err().map(|r| r.status), Some(413));
-    }
 
     #[test]
     fn estatico_nao_sai_da_pasta_ui() {
