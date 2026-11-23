@@ -15,6 +15,16 @@ const LEITURAS_WEB = {
   caixa_situacao: () => '/api/caixa/situacao',
 };
 
+// Administração de aparelhos pelo navegador: só o administrador; o servidor confere a permissão em cada rota.
+const ADMIN_WEB = {
+  dispositivos_listar: { metodo: 'GET', rota: () => '/api/dispositivos' },
+  dispositivos_iniciar_pareamento: { metodo: 'POST', rota: () => '/api/dispositivos/pareamento' },
+  dispositivos_revogar: { metodo: 'POST', rota: (a) => `/api/dispositivos/${encodeURIComponent(a.id)}/revogar` },
+  pareamento_listar_pedidos: { metodo: 'GET', rota: () => '/api/dispositivos/pedidos' },
+  pareamento_aprovar: { metodo: 'POST', rota: (a) => `/api/dispositivos/pedidos/${encodeURIComponent(a.id)}/aprovar` },
+  pareamento_recusar: { metodo: 'POST', rota: (a) => `/api/dispositivos/pedidos/${encodeURIComponent(a.id)}/recusar` },
+};
+
 const indisponivelNoNavegador = (nome) => ({
   texto: `Esta ação ("${nome}") ainda não está disponível pelo navegador. Use o aplicativo no computador principal.`,
   campos: {},
@@ -68,6 +78,10 @@ export async function invocar(comando, args = {}) {
 export async function chamar(nome, args = {}) {
   if (NO_APLICATIVO) {
     return invocar('comando', { nome, args });
+  }
+  const admin = ADMIN_WEB[nome];
+  if (admin) {
+    return http(admin.metodo, admin.rota(args));
   }
   const rota = LEITURAS_WEB[nome];
   if (!rota) {

@@ -172,7 +172,7 @@ fn sessao_guardada_se_le_e_se_apaga() {
 
 #[test]
 fn sessao_expirada_ou_sem_acesso_nao_continua() {
-    let (conn, adm, _ana) = com_admin_e_funcionario();
+    let (conn, adm, ana) = com_admin_e_funcionario();
     let f = match funcionarios::entrar(&conn, "carlos", SENHA, Utc::now()).unwrap() {
         Entrada::Ok(f) => f,
         _ => panic!("login deveria funcionar"),
@@ -183,6 +183,8 @@ fn sessao_expirada_ou_sem_acesso_nao_continua() {
 
     // Login recente, mas o acesso foi tirado depois: não oferece.
     sessao::guardar(&conn, &f, Utc::now()).unwrap();
+    // Sempre deve restar um administrador com acesso: promove a Ana antes de tirar o acesso do Carlos.
+    funcionarios::dar_acesso(&conn, ana, &AcessoInput { login: Some("ana".into()), senha: Some(SENHA.into()), senha_hash: None, perfil: Some("administrador".into()) }).unwrap();
     funcionarios::revogar_acesso(&conn, adm).unwrap();
     assert!(sessao::para_continuar(&conn, Utc::now()).unwrap().is_none());
 }

@@ -9,6 +9,7 @@ import { render as clientesVeiculos } from './pages/clientes_veiculos.js';
 import { render as itens } from './pages/itens.js';
 import { render as caixa } from './pages/caixa.js';
 import { render as funcionarios } from './pages/funcionarios.js';
+import { render as dispositivos } from './pages/dispositivos.js';
 import { render as configuracoes } from './pages/configuracoes.js';
 import { render as registro } from './pages/registro.js';
 import { render as venda } from './pages/venda.js';
@@ -29,6 +30,7 @@ const TELAS = [
   { id: 'clientes', titulo: 'Clientes e Veículos', descricao: 'Telefones, placas e histórico', icone: 'clientes', cor: 'indigo', tecla: 'F5', tile: true, pagina: clientesVeiculos },
   { id: 'caixa', titulo: 'Caixa', descricao: 'Abrir, receber e fechar o caixa do dia', icone: 'caixa', cor: 'cinza', tecla: 'F6', tile: true, pagina: caixa },
   { id: 'funcionarios', titulo: 'Funcionários', descricao: 'Equipe e acessos ao sistema', icone: 'equipe', cor: 'azul', tecla: 'F7', tile: true, admin: true, pagina: funcionarios },
+  { id: 'dispositivos', titulo: 'Dispositivos', descricao: 'Aparelhos autorizados e pareamento', icone: 'equipe', cor: 'cinza', tecla: null, tile: true, admin: true, pagina: dispositivos },
   { id: 'configuracoes', titulo: 'Configurações', descricao: 'Logo, impressora, backup e rede', icone: 'config', cor: 'cinza', tecla: 'F8', tile: true, admin: true, pagina: configuracoes },
   { id: 'registro', titulo: 'Registro de atividades', descricao: 'Quem mexeu em cada coisa e quando', icone: 'registro', cor: 'cinza', tecla: 'F9', tile: true, admin: true, pagina: registro },
   { id: 'venda', titulo: 'Venda Rápida', descricao: 'Peças e serviços vendidos sem carro', icone: 'caixa', cor: 'verde', tecla: 'F10', tile: true, pagina: venda },

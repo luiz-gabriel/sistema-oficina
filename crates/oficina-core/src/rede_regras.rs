@@ -123,7 +123,7 @@ pub fn servidor_aceitavel(epoca_local: u64, epoca_servidor: u64) -> bool {
 }
 
 /// Validade de uma sessão de login na rede.
-pub const VALIDADE_SESSAO: Duration = Duration::from_secs(12 * 60 * 60);
+pub const VALIDADE_SESSAO: Duration = Duration::from_secs(10 * 60 * 60);
 
 /// Sessão emitida pelo servidor no login. A identidade vem daqui, nunca do que o cliente informa em cada comando.
 #[derive(Debug, Clone, PartialEq, Eq)]

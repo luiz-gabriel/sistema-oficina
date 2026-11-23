@@ -17,6 +17,7 @@ pub mod fornecedores;
 pub mod config;
 pub mod dashboard;
 pub mod db;
+pub mod dispositivos;
 pub mod error;
 pub mod financeiro;
 pub mod fidelidade;
@@ -28,6 +29,7 @@ pub mod orcamentos;
 pub mod painel;
 pub mod seguranca;
 pub mod sessao;
+pub mod sessoes;
 pub mod validation;
 pub mod veiculos;
 

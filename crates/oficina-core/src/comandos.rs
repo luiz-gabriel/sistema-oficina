@@ -49,6 +49,8 @@ pub fn pode_executar(perfil: &str, cmd: &str, _args: &Value, _perfil_alvo: Optio
         "caixa_historico" | "financeiro_resumo" | "recebimentos_listar" | "contas_receber_listar"
         | "contas_pagar_listar" | "contas_pagar_criar" | "contas_pagar_pagar" | "painel_serie" => false,
         c if c.starts_with("relatorio_") => false,
+        // Aparelhos e pareamento: só o administrador (a leitura também é restrita).
+        c if c.starts_with("dispositivos_") || c.starts_with("pareamento_") => false,
         _ => true,
     }
 }
@@ -336,6 +338,9 @@ pub fn executar(conn: &Connection, cmd: &str, args: &Value, ctx: &Contexto) -> A
         "dashboard_resumo" => ok(dashboard::resumo(conn)?),
         _ if COMANDOS_COMPRAS.contains(&cmd) => executar_compras(conn, cmd, args, &ctx.usuario),
         // Comandos financeiros (recebimentos, contas a receber/pagar, resumo) vivem em `financeiro`.
+        c if c.starts_with("dispositivos_") || c.starts_with("pareamento_") => {
+            crate::dispositivos::executar(conn, c, args, ctx)
+        }
         _ => crate::financeiro::executar(conn, cmd, args, &ctx.usuario)
             .unwrap_or_else(|| Err(AppError::NotFound(format!("comando desconhecido: {cmd}")))),
     }

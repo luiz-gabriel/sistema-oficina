@@ -6,15 +6,14 @@ pub mod porta;
 mod rotas;
 mod tls;
 
-use std::collections::HashMap;
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderName, HeaderValue, Request as AxRequest, StatusCode};
 use axum::response::Response;
 use axum::Router;
@@ -29,11 +28,9 @@ use crate::estado::Estado;
 pub const NOME_COOKIE: &str = "oficina_sessao";
 const LIMITE_CORPO: usize = 64 * 1024;
 
-/// Estado do servidor web guardado em `Estado`.
+/// Estado do servidor web guardado em `Estado`. As sessões de login ficam no SQLite (`oficina_core::sessoes`).
 #[derive(Default)]
 pub struct Web {
-    /// Sessões de navegador: token do cookie -> usuário. Só em memória.
-    pub sessoes: Mutex<HashMap<String, rotas::SessaoWeb>>,
     ativo: Mutex<Option<Ativo>>,
     erro: Mutex<Option<String>>,
 }
@@ -64,6 +61,10 @@ pub struct Requisicao {
     pub metodo: String,
     pub caminho: String,
     pub cookie: Option<String>,
+    /// Token do aparelho pareado (cabeçalho `X-Oficina-Dispositivo`), usado só no login.
+    pub dispositivo: Option<String>,
+    /// True quando a conexão vem deste próprio computador (endereço de loopback).
+    pub local: bool,
     pub corpo: Vec<u8>,
 }
 
@@ -94,6 +95,11 @@ impl Resposta {
 }
 
 impl Web {
+    /// Endereço atual do servidor (IP e porta), se estiver ligado. Usado para o pareamento de aparelhos.
+    pub fn endereco(&self) -> Option<Endereco> {
+        self.ativo.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|a| a.endereco.clone())
+    }
+
     /// Situação para a tela de configuração: ativo, endereço ou erro.
     pub fn situacao(&self) -> Value {
         let ativo = self.ativo.lock().unwrap_or_else(|e| e.into_inner());
@@ -215,7 +221,8 @@ pub fn iniciar_http(listener: TcpListener, est: Arc<Estado>, ui: PathBuf) -> Han
             Err(e) => return eprintln!("erro ao iniciar o runtime do servidor web: {e}"),
         };
         rt.block_on(async move {
-            if let Err(e) = axum_server::from_tcp(listener).handle(h).serve(roteador(ctx).into_make_service()).await {
+            let app = roteador(ctx).into_make_service_with_connect_info::<SocketAddr>();
+            if let Err(e) = axum_server::from_tcp(listener).handle(h).serve(app).await {
                 eprintln!("erro no servidor web: {e}");
             }
         });
@@ -238,9 +245,10 @@ fn iniciar_https(listener: TcpListener, est: Arc<Estado>, ui: PathBuf, id: tls::
                 Ok(c) => c,
                 Err(e) => return eprintln!("erro ao carregar o certificado HTTPS: {e}"),
             };
+            let app = roteador(ctx).into_make_service_with_connect_info::<SocketAddr>();
             if let Err(e) = axum_server::from_tcp_rustls(listener, config)
                 .handle(h)
-                .serve(roteador(ctx).into_make_service())
+                .serve(app)
                 .await
             {
                 eprintln!("erro no servidor HTTPS: {e}");
@@ -251,7 +259,7 @@ fn iniciar_https(listener: TcpListener, est: Arc<Estado>, ui: PathBuf, id: tls::
 }
 
 /// Converte o pedido axum em `Requisicao`, trata e devolve a resposta.
-async fn atender(State(ctx): State<Ctx>, pedido: AxRequest<Body>) -> Response {
+async fn atender(State(ctx): State<Ctx>, ConnectInfo(origem): ConnectInfo<SocketAddr>, pedido: AxRequest<Body>) -> Response {
     let (partes, corpo) = pedido.into_parts();
     let resposta = match to_bytes(corpo, LIMITE_CORPO).await {
         Err(_) => Resposta::erro(413, "tamanho", "Pedido grande demais."),
@@ -264,6 +272,12 @@ async fn atender(State(ctx): State<Ctx>, pedido: AxRequest<Body>) -> Response {
                     .get(header::COOKIE)
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string),
+                dispositivo: partes
+                    .headers
+                    .get("x-oficina-dispositivo")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string),
+                local: origem.ip().is_loopback(),
                 corpo: bytes.to_vec(),
             };
             tokio::task::spawn_blocking(move || tratar(&ctx.est, &ctx.ui, &req))

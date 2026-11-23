@@ -93,7 +93,7 @@ pub fn atualizar(conn: &Connection, id: i64, input: &FuncionarioInput) -> AppRes
 }
 
 pub fn remover(conn: &Connection, id: i64) -> AppResult<()> {
-    buscar(conn, id)?;
+    garantir_sobra_administrador(conn, &buscar(conn, id)?)?;
     conn.execute("DELETE FROM funcionarios WHERE id = ?1", [id])?;
     Ok(())
 }
@@ -143,9 +143,29 @@ pub fn dar_acesso(conn: &Connection, id: i64, input: &AcessoInput) -> AppResult<
 }
 
 pub fn revogar_acesso(conn: &Connection, id: i64) -> AppResult<Funcionario> {
-    buscar(conn, id)?;
+    let atual = buscar(conn, id)?;
+    garantir_sobra_administrador(conn, &atual)?;
+    if let Some(login) = &atual.login {
+        crate::sessoes::encerrar_usuario(conn, login)?;
+    }
     conn.execute("UPDATE funcionarios SET login=NULL, senha_hash=NULL, perfil='funcionario' WHERE id=?1", [id])?;
     buscar(conn, id)
+}
+
+/// Não deixa o sistema sem administrador: o último administrador com acesso não pode perder o acesso nem ser removido.
+fn garantir_sobra_administrador(conn: &Connection, f: &Funcionario) -> AppResult<()> {
+    if f.perfil != "administrador" || !f.tem_acesso {
+        return Ok(());
+    }
+    let admins: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM funcionarios WHERE perfil = 'administrador' AND senha_hash IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    if admins <= 1 {
+        return Err(AppError::Conflict("Mantenha pelo menos um administrador com acesso ao sistema.".into()));
+    }
+    Ok(())
 }
 
 /// Confere login e senha. Retorna o funcionário quando a senha confere.

@@ -268,6 +268,47 @@ CREATE TABLE IF NOT EXISTS pagamentos_pagar (
   data           TEXT NOT NULL,
   usuario        TEXT NOT NULL
 );
+-- Dispositivos autorizados. O computador principal também é uma linha (principal = 1, sem credencial).
+-- `credencial_hash` é o SHA-256 do token do aparelho (o token nunca é guardado). Datas em RFC 3339 (UTC).
+CREATE TABLE IF NOT EXISTS dispositivos (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  nome            TEXT NOT NULL,
+  principal       INTEGER NOT NULL DEFAULT 0 CHECK (principal IN (0, 1)),
+  criado_em       TEXT NOT NULL,
+  autorizado_em   TEXT,
+  ultimo_acesso   TEXT,
+  situacao        TEXT NOT NULL CHECK (situacao IN ('ATIVO', 'REVOGADO')),
+  credencial_hash TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dispositivos_principal ON dispositivos(principal) WHERE principal = 1;
+-- Pedidos de pareamento enviados pelo aparelho com o código. Só o segredo (hash) fica guardado.
+CREATE TABLE IF NOT EXISTS pedidos_pareamento (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  nome_aparelho  TEXT NOT NULL,
+  criado_em      TEXT NOT NULL,
+  situacao       TEXT NOT NULL CHECK (situacao IN ('PENDENTE', 'APROVADO', 'RECUSADO', 'ENTREGUE')),
+  segredo_hash   TEXT NOT NULL,
+  dispositivo_id INTEGER REFERENCES dispositivos(id),
+  decidido_em    TEXT
+);
+-- Código de confirmação de 6 dígitos: só o hash (com sal) fica guardado. Expiração em segundos Unix (inteiro).
+CREATE TABLE IF NOT EXISTS codigos_pareamento (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  sal                TEXT NOT NULL,
+  codigo_hash        TEXT NOT NULL,
+  criado_em          TEXT NOT NULL,
+  expira_em          INTEGER NOT NULL,
+  tentativas_erradas INTEGER NOT NULL DEFAULT 0 CHECK (tentativas_erradas >= 0),
+  situacao           TEXT NOT NULL CHECK (situacao IN ('ATIVO', 'USADO', 'BLOQUEADO', 'EXPIRADO', 'SUBSTITUIDO'))
+);
+-- Sessões de login no servidor web. Validade absoluta: `expira_em` (segundos Unix) nunca é estendido pelo uso.
+CREATE TABLE IF NOT EXISTS sessoes (
+  token_hash     TEXT PRIMARY KEY,
+  usuario        TEXT NOT NULL,
+  dispositivo_id INTEGER NOT NULL REFERENCES dispositivos(id),
+  criado_em      TEXT NOT NULL,
+  expira_em      INTEGER NOT NULL
+);
 "#;
 
 /// Abre (ou cria) o banco de arquivo e aplica o esquema.
