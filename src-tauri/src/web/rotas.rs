@@ -664,6 +664,51 @@ mod testes {
         assert!(!lista.contains("credencial"));
     }
 
+    /// Pareia um aparelho pelo fluxo SPAKE2 completo e devolve (id do dispositivo, token do aparelho).
+    fn parear_aparelho_web(est: &Arc<Estado>, admin: &str, nome: &str) -> (i64, String) {
+        let codigo = json_do(&pedir(est, &post("/api/dispositivos/pareamento", Some(admin), "")))["codigo"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (iniciado, msg_c) = pake::cliente_iniciar(&codigo);
+        let sessao = json_do(&pedir(est, &post("/api/pareamento/iniciar", None, &format!(r#"{{"msg":"{}"}}"#, hex::encode(&msg_c)))));
+        let msg_s = hex::decode(sessao["msg"].as_str().unwrap()).unwrap();
+        let chave = pake::cliente_concluir(iniciado, &msg_s).unwrap();
+        let mac_c = pake::confirmar_cliente(&chave, &msg_c, &msg_s);
+        let corpo = format!(r#"{{"sessao":{},"nome":"{nome}","mac":"{}"}}"#, sessao["sessao"], hex::encode(&mac_c));
+        let pedido_id = json_do(&pedir(est, &post("/api/pareamento/confirmar", None, &corpo)))["pedido_id"].as_i64().unwrap();
+        let aprovado = json_do(&pedir(est, &post(&format!("/api/dispositivos/pedidos/{pedido_id}/aprovar"), Some(admin), "")));
+        let dispositivo_id = aprovado["id"].as_i64().unwrap();
+        let prova = pake::provar_consulta(&chave, pedido_id);
+        let liberado = json_do(&pedir(est, &post("/api/pareamento/consultar", None, &format!(r#"{{"pedido_id":{pedido_id},"prova":"{prova}"}}"#))));
+        let token = pake::decifrar_token(&chave, liberado["token_cifrado"].as_str().unwrap()).unwrap();
+        (dispositivo_id, token)
+    }
+
+    #[test]
+    fn remover_aparelho_corta_a_sessao_na_proxima_requisicao() {
+        let est = estado_de_teste();
+        let admin = token_do_cookie(&pedir(&est, &login_pedido("segredo123")));
+        let (dispositivo_id, token_aparelho) = parear_aparelho_web(&est, &admin, "Celular da Ana");
+        // O aparelho entra com o token dele e ganha uma sessão.
+        let corpo = r#"{"usuario":"ana","senha":"segredo123"}"#;
+        let login = format!(
+            "POST /api/login HTTP/1.1\r\nHost: t\r\nX-Oficina-Dispositivo: {token_aparelho}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{corpo}",
+            corpo.len()
+        );
+        let sessao_aparelho = token_do_cookie(&pedir(&est, &login));
+        // Antes de remover: a sessão do aparelho enxerga os dados (rota de administrador).
+        assert_eq!(status(&pedir(&est, &get("/api/dispositivos", Some(&sessao_aparelho)))), 200);
+        // O administrador remove o aparelho.
+        let removido = pedir(&est, &post(&format!("/api/dispositivos/{dispositivo_id}/revogar"), Some(&admin), ""));
+        assert_eq!(status(&removido), 200, "{removido}");
+        // Na requisição seguinte, a sessão antiga já não vale: nem os dados, nem um novo login com o token.
+        assert_eq!(status(&pedir(&est, &get("/api/dispositivos", Some(&sessao_aparelho)))), 401);
+        assert_ne!(status(&pedir(&est, &login)), 200, "o token do aparelho removido não entra mais");
+        // A sessão do administrador no computador principal continua valendo.
+        assert_eq!(status(&pedir(&est, &get("/api/dispositivos", Some(&admin)))), 200);
+    }
+
     #[test]
     fn nao_administrador_nao_ve_nem_gera_pareamento() {
         let est = estado_de_teste();

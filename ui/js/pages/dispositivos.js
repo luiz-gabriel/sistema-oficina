@@ -117,12 +117,12 @@ export async function render(container, { estado }) {
         nome_exibicao: d.principal ? `${d.nome} (este computador)` : d.nome,
         situacao_texto: d.situacao === 'ATIVO' ? 'Ativo' : 'Revogado',
         __acoes: d.situacao === 'ATIVO'
-          ? botao({ texto: 'Revogar', icone: 'x', tipo: 'link perigo', onclick: async () => {
+          ? botao({ texto: 'Remover', icone: 'x', tipo: 'link perigo', onclick: async () => {
             const texto = d.principal
-              ? `Revogar ${d.nome}? Este computador deixa de aceitar login. Só é permitido se outro aparelho autorizado e um administrador continuarem com acesso.`
-              : `Revogar ${d.nome}? O aparelho perde o acesso e as sessões dele são encerradas.`;
+              ? `Remover ${d.nome}? Este computador deixa de aceitar login. Só é permitido se outro aparelho autorizado e um administrador continuarem com acesso.`
+              : `Remover ${d.nome}? O aparelho perde o acesso aos dados no mesmo instante e as sessões dele são encerradas.`;
             if (!confirmar(texto)) return;
-            try { await chamar('dispositivos_revogar', { id: d.id }); aviso('Dispositivo revogado.'); await carregarLista(); }
+            try { await chamar('dispositivos_revogar', { id: d.id }); aviso('Dispositivo removido.'); await carregarLista(); }
             catch (e) { aviso(e.texto, 'erro'); }
           } })
           : null,
